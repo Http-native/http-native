@@ -57,13 +57,9 @@ jobs:
           go-version: "1.23"
 
       - name: Install bombardier
-        env:
-          BOMBARDIER_BIN: ${{ runner.temp }}/bombardier
         run: |
-          go install -o "$BOMBARDIER_BIN" github.com/codesenberg/bombardier@latest
-          echo "BOMBARDIER_BIN=$BOMBARDIER_BIN" >> $GITHUB_ENV
-          chmod +x "$BOMBARDIER_BIN"
-          "$BOMBARDIER_BIN" -version || (echo "bombardier failed to install" && exit 1)
+          go install github.com/codesenberg/bombardier@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
 
       - name: Run benchmarks
         run: |
