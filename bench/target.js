@@ -1,4 +1,3 @@
-import { createApp as createOldApp } from "../old/src/index.js";
 import { resolve } from "node:path";
 
 process.env.HTTP_NATIVE_NODE_PATH ??= resolve(process.cwd(), "http-native.release.node");
@@ -160,6 +159,7 @@ if (engine === "bun") {
 } else if (engine === "http-native") {
   await startFrameworkServer(createHttpNativeApp, "http-native", scenario);
 } else if (engine === "old") {
+  const { createApp: createOldApp } = await import("../old/src/index.js");
   await startFrameworkServer(createOldApp, "old", scenario);
 } else {
   throw new Error(`Unsupported benchmark engine: ${engine}`);
