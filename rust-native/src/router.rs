@@ -41,6 +41,7 @@ pub struct MatchedRoute<'a, 'b> {
 #[derive(Clone)]
 struct DynamicRouteSpec {
     handler_id: u32,
+    #[allow(dead_code)]
     param_names: Box<[Box<str>]>,
     header_keys: Box<[Box<str>]>,
     full_headers: bool,
