@@ -30,11 +30,14 @@ const platformArtifact =
       : "libhttp_native_napi.so";
 
 const source = resolve(`rust-native/target/${profile}/${platformArtifact}`);
-const target = resolve("http-native.node");
+const profileTarget = resolve(`http-native.${profile}.node`);
+const defaultTarget = resolve("http-native.node");
 
 if (!existsSync(source)) {
   throw new Error(`Native artifact not found at ${source}`);
 }
 
-copyFileSync(source, target);
-console.log(`[http-native] wrote ${target}`);
+copyFileSync(source, profileTarget);
+copyFileSync(source, defaultTarget);
+console.log(`[http-native] wrote ${profileTarget}`);
+console.log(`[http-native] wrote ${defaultTarget}`);

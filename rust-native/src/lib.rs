@@ -341,8 +341,10 @@ async fn run_server(
                     break;
                 }
 
-                if let Err(error) = stream.set_nodelay(true) {
-                    eprintln!("[http-native] failed to enable TCP_NODELAY: {error}");
+                if should_enable_nodelay() {
+                    if let Err(error) = stream.set_nodelay(true) {
+                        eprintln!("[http-native] failed to enable TCP_NODELAY: {error}");
+                    }
                 }
 
                 let router = Arc::clone(&router);
@@ -377,25 +379,28 @@ async fn handle_connection(
     server_config: Arc<HttpServerConfig>,
 ) -> Result<()> {
     let mut buffer: Vec<u8> = Vec::with_capacity(8192);
+    let mut buffer_start = 0usize;
 
     loop {
         let request_head = loop {
+            let readable = &buffer[buffer_start..];
             let request_head = if router.exact_get_root().is_some() {
-                parse_hot_root_request_head(&buffer, server_config.as_ref())
-                    .or_else(|| parse_request_head(&buffer))
+                parse_hot_root_request_head(readable, server_config.as_ref())
+                    .or_else(|| parse_request_head(readable))
             } else {
-                parse_request_head(&buffer)
+                parse_request_head(readable)
             };
 
             if let Some(request_head) = request_head {
                 break request_head;
             }
 
-            if find_header_end(&buffer).is_some() {
+            if find_header_end(readable).is_some() {
                 stream.shutdown().await?;
                 return Ok(());
             }
 
+            compact_read_buffer(&mut buffer, &mut buffer_start);
             let (read_result, next_buffer) = stream.read(buffer).await;
             buffer = next_buffer;
             let bytes_read = read_result?;
@@ -404,7 +409,7 @@ async fn handle_connection(
                 return Ok(());
             }
 
-            if buffer.len() > server_config.max_header_bytes {
+            if buffer.len().saturating_sub(buffer_start) > server_config.max_header_bytes {
                 stream.shutdown().await?;
                 return Ok(());
             }
@@ -421,7 +426,7 @@ async fn handle_connection(
         if let Some(static_route) =
             resolve_static_fast_path(&router, &request_head, server_config.as_ref())
         {
-            drain_consumed_bytes(&mut buffer, header_bytes);
+            consume_read_buffer(&mut buffer, &mut buffer_start, header_bytes);
             write_exact_static_response(&mut stream, static_route, keep_alive).await?;
 
             if !keep_alive {
@@ -432,9 +437,12 @@ async fn handle_connection(
             continue;
         }
 
-        let dispatch_request =
-            build_manual_dispatch_request(&router, &buffer[..header_bytes], &request_head)?;
-        drain_consumed_bytes(&mut buffer, header_bytes);
+        let dispatch_request = build_manual_dispatch_request(
+            &router,
+            &buffer[buffer_start..buffer_start + header_bytes],
+            &request_head,
+        )?;
+        consume_read_buffer(&mut buffer, &mut buffer_start, header_bytes);
 
         match dispatch_request {
             Some(request) => {
@@ -480,15 +488,34 @@ fn parse_hot_root_request_head_prefix(
     request_head.method == b"GET" && request_head.path == b"/"
 }
 
-fn drain_consumed_bytes(buffer: &mut Vec<u8>, consumed: usize) {
-    if consumed >= buffer.len() {
-        buffer.clear();
+fn compact_read_buffer(buffer: &mut Vec<u8>, buffer_start: &mut usize) {
+    if *buffer_start == 0 {
         return;
     }
 
-    let remaining = buffer.len() - consumed;
-    buffer.copy_within(consumed.., 0);
+    if *buffer_start >= buffer.len() {
+        buffer.clear();
+        *buffer_start = 0;
+        return;
+    }
+
+    if *buffer_start < 4096 && buffer.len() < buffer.capacity() {
+        return;
+    }
+
+    let remaining = buffer.len() - *buffer_start;
+    buffer.copy_within(*buffer_start.., 0);
     buffer.truncate(remaining);
+    *buffer_start = 0;
+}
+
+fn consume_read_buffer(buffer: &mut Vec<u8>, buffer_start: &mut usize, consumed: usize) {
+    *buffer_start = (*buffer_start).saturating_add(consumed);
+
+    if *buffer_start >= buffer.len() {
+        buffer.clear();
+        *buffer_start = 0;
+    }
 }
 
 fn bind_listener(
@@ -501,13 +528,25 @@ fn bind_listener(
         .unwrap_or(server_config.default_host.as_str());
     let bind_addr = resolve_socket_addr(host, options.port)
         .with_context(|| format!("failed to resolve bind address {host}:{}", options.port))?;
-    let listener_opts = ListenerOpts::new()
+    let mut listener_opts = ListenerOpts::new()
         .reuse_addr(true)
-        .reuse_port(true)
         .backlog(options.backlog.unwrap_or(server_config.default_backlog));
+    if worker_count_for(options) > 1 {
+        listener_opts = listener_opts.reuse_port(true);
+    }
 
     TcpListener::bind_with_config(bind_addr, &listener_opts)
         .with_context(|| format!("failed to bind TCP listener on {bind_addr}"))
+}
+
+fn should_enable_nodelay() -> bool {
+    std::env::var("HTTP_NATIVE_TCP_NODELAY")
+        .ok()
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(true)
 }
 
 fn resolve_socket_addr(host: &str, port: u16) -> Result<SocketAddr> {
@@ -938,44 +977,15 @@ fn parse_request_head(bytes: &[u8]) -> Option<RequestHead<'_>> {
     let version = &request_line[second_space + 1..];
     let path = target.split(|byte| *byte == b'?').next()?;
 
-    let mut keep_alive = version.eq_ignore_ascii_case(b"HTTP/1.1");
-    let mut has_body = false;
-    let mut line_start = line_end + 2;
-
-    while line_start + 2 <= header_end {
-        let next_end = memmem::find(&bytes[line_start..header_end + 2], b"\r\n")? + line_start;
-
-        if next_end == line_start {
-            break;
-        }
-
-        let line = &bytes[line_start..next_end];
-        if line.len() >= 11 && line[..11].eq_ignore_ascii_case(b"connection:") {
-            let value = &line[11..];
-            if contains_ascii_case_insensitive(value, b"close") {
-                keep_alive = false;
-            }
-            if contains_ascii_case_insensitive(value, b"keep-alive") {
-                keep_alive = true;
-            }
-        }
-
-        if line.len() >= 15 && line[..15].eq_ignore_ascii_case(b"content-length:") {
-            let value = trim_ascii_spaces(&line[15..]);
-            if value != b"0" {
-                has_body = true;
-            }
-        }
-
-        if line.len() >= 18 && line[..18].eq_ignore_ascii_case(b"transfer-encoding:") {
-            let value = trim_ascii_spaces(&line[18..]);
-            if !value.is_empty() && !value.eq_ignore_ascii_case(b"identity") {
-                has_body = true;
-            }
-        }
-
-        line_start = next_end + 2;
-    }
+    let (keep_alive, has_body) = scan_header_controls(
+        bytes,
+        line_end + 2,
+        header_end,
+        version.eq_ignore_ascii_case(b"HTTP/1.1"),
+        b"connection:",
+        b"content-length:",
+        b"transfer-encoding:",
+    )?;
 
     Some(RequestHead {
         method,
@@ -1001,51 +1011,15 @@ fn parse_hot_root_request_head(
         };
 
     let header_end = find_header_end(bytes)?;
-    let mut keep_alive = keep_alive;
-    let mut has_body = false;
-    let mut line_start = request_line_len;
-
-    while line_start <= header_end {
-        let next_end = memmem::find(&bytes[line_start..header_end + 2], b"\r\n")? + line_start;
-
-        if next_end == line_start {
-            break;
-        }
-
-        let line = &bytes[line_start..next_end];
-        if line.len() >= server_config.header_connection_prefix.len()
-            && line[..server_config.header_connection_prefix.len()]
-                .eq_ignore_ascii_case(server_config.header_connection_prefix.as_slice())
-        {
-            let value = &line[server_config.header_connection_prefix.len()..];
-            if contains_ascii_case_insensitive(value, b"close") {
-                keep_alive = false;
-            }
-            if contains_ascii_case_insensitive(value, b"keep-alive") {
-                keep_alive = true;
-            }
-        } else if line.len() >= server_config.header_content_length_prefix.len()
-            && line[..server_config.header_content_length_prefix.len()]
-                .eq_ignore_ascii_case(server_config.header_content_length_prefix.as_slice())
-        {
-            let value =
-                trim_ascii_spaces(&line[server_config.header_content_length_prefix.len()..]);
-            if value != b"0" {
-                has_body = true;
-            }
-        } else if line.len() >= server_config.header_transfer_encoding_prefix.len()
-            && line[..server_config.header_transfer_encoding_prefix.len()]
-                .eq_ignore_ascii_case(server_config.header_transfer_encoding_prefix.as_slice())
-        {
-            let value =
-                trim_ascii_spaces(&line[server_config.header_transfer_encoding_prefix.len()..]);
-            if !value.is_empty() && !value.eq_ignore_ascii_case(b"identity") {
-                has_body = true;
-            }
-        }
-
-        line_start = next_end + 2;
-    }
+    let (keep_alive, has_body) = scan_header_controls(
+        bytes,
+        request_line_len,
+        header_end,
+        keep_alive,
+        server_config.header_connection_prefix.as_slice(),
+        server_config.header_content_length_prefix.as_slice(),
+        server_config.header_transfer_encoding_prefix.as_slice(),
+    )?;
 
     Some(RequestHead {
         method: b"GET",
@@ -1059,6 +1033,84 @@ fn parse_hot_root_request_head(
 
 fn find_header_end(bytes: &[u8]) -> Option<usize> {
     memmem::find(bytes, b"\r\n\r\n")
+}
+
+fn scan_header_controls(
+    bytes: &[u8],
+    mut line_start: usize,
+    header_end: usize,
+    mut keep_alive: bool,
+    connection_prefix: &[u8],
+    content_length_prefix: &[u8],
+    transfer_encoding_prefix: &[u8],
+) -> Option<(bool, bool)> {
+    let mut has_body = false;
+
+    while line_start <= header_end {
+        let next_end = find_line_end(bytes, line_start, header_end)?;
+        if next_end == line_start {
+            break;
+        }
+
+        let line = &bytes[line_start..next_end];
+        match ascii_lowercase(line[0]) {
+            b'c' => {
+                if line.len() >= connection_prefix.len()
+                    && line[..connection_prefix.len()].eq_ignore_ascii_case(connection_prefix)
+                {
+                    let value = &line[connection_prefix.len()..];
+                    if contains_ascii_case_insensitive(value, b"close") {
+                        keep_alive = false;
+                    }
+                    if contains_ascii_case_insensitive(value, b"keep-alive") {
+                        keep_alive = true;
+                    }
+                } else if line.len() >= content_length_prefix.len()
+                    && line[..content_length_prefix.len()]
+                        .eq_ignore_ascii_case(content_length_prefix)
+                {
+                    let value = trim_ascii_spaces(&line[content_length_prefix.len()..]);
+                    if value != b"0" {
+                        has_body = true;
+                    }
+                }
+            }
+            b't' => {
+                if line.len() >= transfer_encoding_prefix.len()
+                    && line[..transfer_encoding_prefix.len()]
+                        .eq_ignore_ascii_case(transfer_encoding_prefix)
+                {
+                    let value = trim_ascii_spaces(&line[transfer_encoding_prefix.len()..]);
+                    if !value.is_empty() && !value.eq_ignore_ascii_case(b"identity") {
+                        has_body = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        line_start = next_end + 2;
+    }
+
+    Some((keep_alive, has_body))
+}
+
+fn find_line_end(bytes: &[u8], line_start: usize, header_end: usize) -> Option<usize> {
+    let relative_end = memchr(b'\r', &bytes[line_start..header_end + 2])?;
+    let line_end = line_start + relative_end;
+    if bytes.get(line_end + 1) != Some(&b'\n') {
+        return None;
+    }
+
+    Some(line_end)
+}
+
+fn ascii_lowercase(byte: u8) -> u8 {
+    if byte.is_ascii_uppercase() {
+        byte + 32
+    } else {
+        byte
+    }
 }
 
 fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {

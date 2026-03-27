@@ -1,4 +1,8 @@
-import { createApp } from "../src/index.js";
+import { resolve } from "node:path";
+
+process.env.HTTP_NATIVE_NODE_PATH ??= resolve(process.cwd(), "http-native.release.node");
+
+const { createApp } = await import("../src/index.js");
 
 const db = {
   async getUser(id) {

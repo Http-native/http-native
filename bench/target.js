@@ -1,5 +1,9 @@
-import { createApp as createHttpNativeApp } from "../src/index.js";
 import { createApp as createOldApp } from "../old/src/index.js";
+import { resolve } from "node:path";
+
+process.env.HTTP_NATIVE_NODE_PATH ??= resolve(process.cwd(), "http-native.release.node");
+
+const { createApp: createHttpNativeApp } = await import("../src/index.js");
 
 const [, , engine, scenario, portArg] = process.argv;
 const port = Number(portArg ?? 0);

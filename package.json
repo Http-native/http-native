@@ -12,6 +12,7 @@
     "build:release": "bun scripts/build-native.mjs --release",
     "build:old:release": "cargo build --release --manifest-path old/native/Cargo.toml",
     "test": "bun run build && bun test/test.js",
+    "bench:ci": "bun bench/ci.js",
     "bench": "bun run build:release && cargo build --release --manifest-path old/native/Cargo.toml && bun bench/run.js",
     "bench:http-native:static": "bun run build:release && bun bench/run.js http-native static 3001",
     "bench:bun:static": "bun bench/run.js bun static 3000",

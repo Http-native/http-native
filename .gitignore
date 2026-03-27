@@ -4,6 +4,8 @@ rust-native/target/
 old/native/target/
 .DS_Store
 http-native.node
+http-native.debug.node
+http-native.release.node
 http-native-bin-arm-mac.zip
 .http-native/
 additions.md
@@ -11,3 +13,4 @@ old/
 #opt/
 .zig-cache
 zig-httpz
+bench/results/
