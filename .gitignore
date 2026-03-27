@@ -14,3 +14,4 @@ old/
 .zig-cache
 zig-httpz
 bench/results/
+testing/

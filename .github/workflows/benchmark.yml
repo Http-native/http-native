@@ -49,9 +49,13 @@ jobs:
           go-version: "1.23"
 
       - name: Install bombardier
+        env:
+          BOMBARDIER_BIN: ${{ runner.temp }}/bombardier
         run: |
-          go install github.com/codesenberg/bombardier@latest
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          go install -o "$BOMBARDIER_BIN" github.com/codesenberg/bombardier@latest
+          echo "BOMBARDIER_BIN=$BOMBARDIER_BIN" >> $GITHUB_ENV
+          chmod +x "$BOMBARDIER_BIN"
+          "$BOMBARDIER_BIN" -version || (echo "bombardier failed to install" && exit 1)
 
       - name: Run benchmarks
         run: |
@@ -63,9 +67,11 @@ jobs:
             --timeout="${{ github.event.inputs.timeout || '2s' }}"
 
       - name: Upload benchmark artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
           path: |
             bench/results/results.json
             bench/results/summary.md
+          if-no-files-found: ignore
