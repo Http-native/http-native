@@ -1,6 +1,4 @@
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::HashMap;
+use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,27 +32,13 @@ pub struct MiddlewareInput {
 #[serde(rename_all = "camelCase")]
 pub struct RouteInput {
     pub method: String,
+    pub method_code: u8,
     pub path: String,
+    pub route_kind: u8,
     pub handler_id: u32,
     pub handler_source: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DispatchRequest {
-    pub handler_id: u32,
-    pub method: String,
-    pub path: String,
-    pub url: String,
-    pub params: HashMap<String, String>,
-    pub query: Value,
-    pub headers: HashMap<String, String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DispatchResponse {
-    pub status: u16,
-    pub headers: HashMap<String, String>,
-    pub body_base64: String,
+    pub param_names: Vec<String>,
+    pub segment_count: u16,
+    pub header_keys: Vec<String>,
+    pub full_headers: bool,
 }

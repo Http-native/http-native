@@ -1,3 +1,5 @@
+import { Buffer } from "node:buffer";
+
 const HOT_HIT_THRESHOLD = 128;
 const STABLE_RESPONSE_THRESHOLD = 32;
 
@@ -15,16 +17,16 @@ export function createRuntimeOptimizer(routes, middlewares, options = {}) {
 
       entry.hits += 1;
       entry.lastHitAt = new Date().toISOString();
-      entry.jsBridgeObserved = true;
+      entry.bridgeObserved = true;
 
       if (entry.stage === "cold" && entry.hits >= HOT_HIT_THRESHOLD) {
         entry.stage = "hot";
         maybeNotify(
           notify,
           entry,
-          entry.nativeStaticHot
-            ? `${entry.label} is serving from native static bytes`
-            : `${entry.label} is hot on the JS bridge`,
+          entry.staticFastPath
+            ? `${entry.label} is serving from the static fast path`
+            : `${entry.label} is hot on bridge dispatch`,
         );
       }
 
@@ -62,8 +64,11 @@ export function createRuntimeOptimizer(routes, middlewares, options = {}) {
           label: entry.label,
           stage: entry.stage,
           hits: entry.hits,
-          nativeStaticHot: entry.nativeStaticHot,
-          jsBridgeObserved: entry.jsBridgeObserved,
+          staticFastPath: entry.staticFastPath,
+          binaryBridge: entry.binaryBridge,
+          dispatchKind: entry.dispatchKind,
+          jsonFastPath: entry.jsonFastPath,
+          bridgeObserved: entry.bridgeObserved,
           cacheCandidate: entry.cacheCandidate,
           recommendation: entry.recommendation,
           reasons: [...entry.reasons],
@@ -76,12 +81,15 @@ export function createRuntimeOptimizer(routes, middlewares, options = {}) {
       return routeEntries
         .map((entry) => {
           const flags = [];
-          if (entry.nativeStaticHot) {
-            flags.push("native-static-hot");
+          if (entry.staticFastPath) {
+            flags.push("static-fast-path");
           } else {
-            flags.push("js-bridge");
+            flags.push("bridge-dispatch");
           }
-          if (entry.jsBridgeObserved) {
+          if (entry.binaryBridge) {
+            flags.push("binary-bridge");
+          }
+          if (entry.bridgeObserved) {
             flags.push("bridge-observed");
           }
           if (entry.cacheCandidate) {
@@ -104,9 +112,9 @@ function buildRouteEntry(route, middlewares) {
     pathPrefixMatches(middleware.pathPrefix, route.path),
   );
   const source = route.handlerSource ?? "";
-  const nativeStaticHot = isNativeStaticHotCandidate(route, hasMiddleware, source);
+  const staticFastPath = isStaticFastPathCandidate(route, hasMiddleware, source);
   const cacheCandidate =
-    !nativeStaticHot &&
+    !staticFastPath &&
     route.method === "GET" &&
     !hasParams &&
     !hasMiddleware &&
@@ -115,10 +123,10 @@ function buildRouteEntry(route, middlewares) {
     !/Date\.now|new Date|Math\.random|crypto\./.test(source);
 
   const reasons = [];
-  if (nativeStaticHot) {
-    reasons.push("served by native static hot path");
+  if (staticFastPath) {
+    reasons.push("served by static fast path");
   } else {
-    reasons.push("served through JS bridge");
+    reasons.push("served through bridge dispatch");
   }
   if (hasMiddleware) {
     reasons.push("middleware blocks static promotion");
@@ -138,8 +146,11 @@ function buildRouteEntry(route, middlewares) {
     stage: "cold",
     hits: 0,
     lastHitAt: null,
-    nativeStaticHot,
-    jsBridgeObserved: false,
+    staticFastPath,
+    binaryBridge: true,
+    dispatchKind: route.dispatchKind ?? "generic_fallback",
+    jsonFastPath: route.jsonFastPath ?? "fallback",
+    bridgeObserved: false,
     cacheCandidate,
     recommendation: null,
     reasons,
@@ -148,7 +159,7 @@ function buildRouteEntry(route, middlewares) {
   };
 }
 
-function isNativeStaticHotCandidate(route, hasMiddleware, source) {
+function isStaticFastPathCandidate(route, hasMiddleware, source) {
   if (route.method !== "GET" || route.path.includes(":") || hasMiddleware) {
     return false;
   }
@@ -250,7 +261,7 @@ function buildResponseKey(snapshot) {
   return JSON.stringify({
     status: snapshot.status,
     headers: snapshot.headers,
-    bodyBase64: snapshot.bodyBase64,
+    bodyBase64: Buffer.from(snapshot.body ?? []).toString("base64"),
   });
 }
 

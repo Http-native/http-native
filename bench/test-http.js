@@ -27,7 +27,6 @@ app.get("/users/:id", async (req, res) => {
 
 const server = await app.listen({
   port: 3001,
-  opt: { notify: true },
 });
 
 console.log(`Server running at ${server.url}`);

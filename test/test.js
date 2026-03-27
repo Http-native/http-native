@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
+import net from "node:net";
 
 import httpServerConfig from "../src/http-server.config.js";
 import { createApp } from "../src/index.js";
@@ -7,6 +9,101 @@ const stablePayload = {
   ok: true,
   mode: "js-cache-candidate",
 };
+
+async function sendKeepAliveSequence(serverUrl, requests) {
+  const url = new URL(serverUrl);
+  const expectedResponses = requests.length;
+  const responses = [];
+  let raw = "";
+
+  await new Promise((resolve, reject) => {
+    const socket = net.createConnection({
+      host: url.hostname,
+      port: Number(url.port),
+    });
+
+    socket.setEncoding("utf8");
+    socket.once("error", reject);
+
+    socket.on("data", (chunk) => {
+      raw += chunk;
+
+      while (responses.length < expectedResponses) {
+        const parsed = parseNextHttpResponse(raw);
+        if (!parsed) {
+          break;
+        }
+
+        responses.push(parsed.response);
+        raw = parsed.rest;
+      }
+
+      if (responses.length === expectedResponses) {
+        socket.end();
+      }
+    });
+
+    socket.once("end", () => {
+      if (responses.length === expectedResponses) {
+        resolve();
+        return;
+      }
+
+      reject(new Error(`socket closed early with ${responses.length}/${expectedResponses} responses`));
+    });
+
+    socket.write(requests.join(""));
+  });
+
+  return responses;
+}
+
+function parseNextHttpResponse(raw) {
+  const headerEnd = raw.indexOf("\r\n\r\n");
+  if (headerEnd < 0) {
+    return null;
+  }
+
+  const headerBlock = raw.slice(0, headerEnd);
+  const lines = headerBlock.split("\r\n");
+  const statusLine = lines.shift();
+  if (!statusLine) {
+    return null;
+  }
+
+  const statusMatch = /^HTTP\/1\.1\s+(\d{3})/.exec(statusLine);
+  if (!statusMatch) {
+    return null;
+  }
+
+  const headers = {};
+  for (const line of lines) {
+    const separatorIndex = line.indexOf(":");
+    if (separatorIndex < 0) {
+      continue;
+    }
+
+    const name = line.slice(0, separatorIndex).toLowerCase();
+    const value = line.slice(separatorIndex + 1).trim();
+    headers[name] = value;
+  }
+
+  const contentLength = Number(headers["content-length"] ?? 0);
+  const bodyStart = headerEnd + 4;
+  const bodyEnd = bodyStart + contentLength;
+  if (raw.length < bodyEnd) {
+    return null;
+  }
+
+  return {
+    response: {
+      status: Number(statusMatch[1]),
+      headers,
+      body: raw.slice(bodyStart, bodyEnd),
+    },
+    rest: raw.slice(bodyEnd),
+  };
+}
 
 async function main() {
   assert.equal(httpServerConfig.defaultHost, "127.0.0.1");
@@ -21,8 +118,14 @@ async function main() {
       };
     },
   };
+  const chainOrder = [];
 
   const app = createApp();
+
+  app.use("/users", async (req, res, next) => {
+    res.header("x-powered-by", "http-native");
+    await next();
+  });
 
   app.get("/", (req, res) => {
     res.json({
@@ -40,6 +143,55 @@ async function main() {
     res.json(user);
   });
 
+  app.use("/chain", async (req, res, next) => {
+    chainOrder.push(`a:${req.method}:${req.path}`);
+    await next();
+    chainOrder.push("a:after");
+  });
+
+  app.use("/chain", async (req, res, next) => {
+    chainOrder.push(`b:${req.query.q}:${req.header("x-chain")}`);
+    await next();
+  });
+
+  app.get("/chain/:id", (req, res) => {
+    chainOrder.push(`h:${req.params.id}`);
+    res.json({
+      id: req.params.id,
+      q: req.query.q,
+      header: req.headers["x-chain"],
+    });
+  });
+
+  app.get("/fallback", (req, res) => {
+    const { headers, query } = req;
+    res.json({
+      accept: headers.accept,
+      q: query.q,
+    });
+  });
+
+  app.get("/search", (req, res) => {
+    res.json({
+      q: req.query.q,
+      tag: req.query.tag,
+      trace: req.header("x-trace"),
+      accept: req.headers.accept,
+    });
+  });
+
+  app.get("/text", (req, res) => {
+    res.type("text").send("hello from binary bridge");
+  });
+
+  app.get("/binary", (req, res) => {
+    res.send(Buffer.from([1, 2, 3, 4]));
+  });
+
+  app.get("/empty", (req, res) => {
+    res.status(204).send();
+  });
+
   const server = await app.listen({
     port: 0,
     serverConfig: {
@@ -47,8 +199,37 @@ async function main() {
       maxHeaderBytes: httpServerConfig.maxHeaderBytes,
     },
   });
+  let closed = false;
 
   try {
+    const keepAliveResponses = await sendKeepAliveSequence(server.url, [
+      "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n",
+      "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    ]);
+    assert.equal(keepAliveResponses.length, 2);
+    assert.deepEqual(
+      keepAliveResponses.map((response) => ({
+        status: response.status,
+        body: JSON.parse(response.body),
+      })),
+      [
+        {
+          status: 200,
+          body: {
+            ok: true,
+            engine: "rust",
+          },
+        },
+        {
+          status: 200,
+          body: {
+            ok: true,
+            engine: "rust",
+          },
+        },
+      ],
+    );
+
     const rootResponse = await fetch(new URL("/", server.url));
     assert.equal(rootResponse.status, 200);
     assert.deepEqual(await rootResponse.json(), {
@@ -58,9 +239,68 @@ async function main() {
 
     const userResponse = await fetch(new URL("/users/42", server.url));
     assert.equal(userResponse.status, 200);
+    assert.equal(userResponse.headers.get("x-powered-by"), "http-native");
     assert.deepEqual(await userResponse.json(), {
       id: "42",
       name: "Ada Lovelace",
+    });
+
+    const chainResponse = await fetch(new URL("/chain/7?q=fast", server.url), {
+      headers: {
+        "x-chain": "compiled",
+      },
+    });
+    assert.equal(chainResponse.status, 200);
+    assert.deepEqual(await chainResponse.json(), {
+      id: "7",
+      q: "fast",
+      header: "compiled",
+    });
+    assert.deepEqual(chainOrder, [
+      "a:GET:/chain/7",
+      "b:fast:compiled",
+      "a:after",
+      "h:7",
+    ]);
+
+    const searchResponse = await fetch(new URL("/search?q=ada&tag=math&tag=logic", server.url), {
+      headers: {
+        "x-trace": "bridge-test",
+        accept: "application/json",
+      },
+    });
+    assert.equal(searchResponse.status, 200);
+    assert.deepEqual(await searchResponse.json(), {
+      q: "ada",
+      tag: ["math", "logic"],
+      trace: "bridge-test",
+      accept: "application/json",
+    });
+
+    const textResponse = await fetch(new URL("/text", server.url));
+    assert.equal(textResponse.status, 200);
+    assert.equal(await textResponse.text(), "hello from binary bridge");
+
+    const binaryResponse = await fetch(new URL("/binary", server.url));
+    assert.equal(binaryResponse.status, 200);
+    assert.deepEqual(
+      Array.from(new Uint8Array(await binaryResponse.arrayBuffer())),
+      [1, 2, 3, 4],
+    );
+
+    const emptyResponse = await fetch(new URL("/empty", server.url));
+    assert.equal(emptyResponse.status, 204);
+    assert.equal(await emptyResponse.text(), "");
+
+    const fallbackResponse = await fetch(new URL("/fallback?q=safe", server.url), {
+      headers: {
+        accept: "application/json",
+      },
+    });
+    assert.equal(fallbackResponse.status, 200);
+    assert.deepEqual(await fallbackResponse.json(), {
+      accept: "application/json",
+      q: "safe",
     });
 
     for (let index = 0; index < 32; index += 1) {
@@ -79,32 +319,54 @@ async function main() {
     const userRoute = snapshot.routes.find(
       (route) => route.method === "GET" && route.path === "/users/:id",
     );
+    const chainRoute = snapshot.routes.find(
+      (route) => route.method === "GET" && route.path === "/chain/:id",
+    );
+    const fallbackRoute = snapshot.routes.find(
+      (route) => route.method === "GET" && route.path === "/fallback",
+    );
 
     assert.ok(rootRoute);
     assert.ok(stableRoute);
     assert.ok(userRoute);
+    assert.ok(chainRoute);
+    assert.ok(fallbackRoute);
 
-    assert.equal(rootRoute.nativeStaticHot, true);
-    assert.equal(rootRoute.hits, 1);
-    assert.equal(rootRoute.jsBridgeObserved, true);
+    assert.equal(rootRoute.staticFastPath, true);
+    assert.equal(rootRoute.binaryBridge, true);
+    assert.equal(rootRoute.bridgeObserved, false);
 
-    assert.equal(stableRoute.nativeStaticHot, false);
-    assert.equal(stableRoute.jsBridgeObserved, true);
+    assert.equal(stableRoute.staticFastPath, false);
+    assert.equal(stableRoute.binaryBridge, true);
+    assert.equal(stableRoute.bridgeObserved, true);
     assert.equal(stableRoute.cacheCandidate, true);
     assert.equal(stableRoute.hits, 32);
     assert.equal(stableRoute.recommendation, "cache-candidate");
 
-    assert.equal(userRoute.nativeStaticHot, false);
-    assert.equal(userRoute.jsBridgeObserved, true);
+    assert.equal(userRoute.staticFastPath, false);
+    assert.equal(userRoute.binaryBridge, true);
+    assert.equal(userRoute.bridgeObserved, true);
     assert.equal(userRoute.cacheCandidate, false);
     assert.equal(userRoute.hits, 1);
+    assert.equal(userRoute.dispatchKind, "specialized");
+    assert.equal(userRoute.jsonFastPath, "generic");
+
+    assert.equal(chainRoute.dispatchKind, "specialized");
+    assert.equal(chainRoute.jsonFastPath, "specialized");
+    assert.equal(fallbackRoute.dispatchKind, "generic_fallback");
+    assert.equal(fallbackRoute.jsonFastPath, "specialized");
 
     const summary = server.optimizations.summary();
-    assert.match(summary, /GET \/ \[native-static-hot, bridge-observed\]/);
-    assert.match(summary, /GET \/stable \[js-bridge, bridge-observed, cache-candidate\]/);
-    assert.match(summary, /GET \/users\/:id \[js-bridge, bridge-observed\]/);
-  } finally {
+    assert.match(summary, /GET \/ \[static-fast-path, binary-bridge\]/);
+    assert.match(summary, /GET \/stable \[bridge-dispatch, binary-bridge, bridge-observed, cache-candidate\]/);
+    assert.match(summary, /GET \/users\/:id \[bridge-dispatch, binary-bridge, bridge-observed\]/);
+
     await Promise.resolve(server.close());
+    closed = true;
+  } finally {
+    if (!closed) {
+      await Promise.resolve(server.close());
+    }
   }
 
   console.log("[http-native] test suite passed");

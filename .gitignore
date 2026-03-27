@@ -9,3 +9,5 @@ http-native-bin-arm-mac.zip
 additions.md
 old/
 #opt/
+.zig-cache
+zig-httpz

@@ -5,20 +5,37 @@ use std::collections::HashMap;
 use crate::analyzer::{
     analyze_route, normalize_path, parse_segments, AnalysisResult, RouteSegment,
 };
-use crate::manifest::ManifestInput;
+use crate::manifest::{ManifestInput, RouteInput};
+
+const ROUTE_KIND_EXACT: u8 = 1;
+const ROUTE_KIND_PARAM: u8 = 2;
 
 #[derive(Clone)]
 pub struct Router {
     exact_get_root: Option<ExactStaticRoute>,
-    dynamic_routes: Vec<Route>,
+    dynamic_exact_routes: HashMap<MethodKey, HashMap<Box<[u8]>, DynamicRouteSpec>>,
+    dynamic_param_routes: HashMap<MethodKey, HashMap<u16, Vec<ParamRoute>>>,
     exact_static_routes: HashMap<MethodKey, HashMap<Box<[u8]>, ExactStaticRoute>>,
 }
 
 #[derive(Clone)]
-struct Route {
-    method: String,
-    segments: Vec<RouteSegment>,
+struct ParamRoute {
+    spec: DynamicRouteSpec,
+    segments: Vec<CompiledSegment>,
+}
+
+#[derive(Clone)]
+struct DynamicRouteSpec {
     handler_id: u32,
+    param_names: Box<[Box<str>]>,
+    header_keys: Box<[Box<str>]>,
+    full_headers: bool,
+}
+
+#[derive(Clone)]
+enum CompiledSegment {
+    Static(Box<str>),
+    Param,
 }
 
 #[derive(Clone)]
@@ -27,10 +44,11 @@ pub struct ExactStaticRoute {
     pub keep_alive_response: Bytes,
 }
 
-#[derive(Clone)]
-pub struct MatchedRoute {
+pub struct MatchedRoute<'a, 'b> {
     pub handler_id: u32,
-    pub params: HashMap<String, String>,
+    pub param_values: Vec<&'b str>,
+    pub header_keys: &'a [Box<str>],
+    pub full_headers: bool,
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -47,14 +65,15 @@ enum MethodKey {
 impl Router {
     pub fn from_manifest(manifest: &ManifestInput) -> Result<Self> {
         let mut exact_get_root = None;
-        let mut dynamic_routes = Vec::with_capacity(manifest.routes.len());
+        let mut dynamic_exact_routes = HashMap::new();
+        let mut dynamic_param_routes = HashMap::new();
         let mut exact_static_routes = HashMap::new();
 
         for route in &manifest.routes {
             let method = route.method.to_uppercase();
             let path = normalize_path(route.path.as_str());
-            let segments = parse_segments(path.as_str());
-            if let AnalysisResult::ExactNativeStaticHot(spec) = analyze_route(route, &manifest.middlewares)
+            if let AnalysisResult::ExactStaticFastPath(spec) =
+                analyze_route(route, &manifest.middlewares)
             {
                 let Some(method_key) = MethodKey::from_method_str(method.as_str()) else {
                     continue;
@@ -85,52 +104,90 @@ impl Router {
                 continue;
             }
 
-            dynamic_routes.push(Route {
-                method,
-                segments,
-                handler_id: route.handler_id,
-            });
+            let Some(method_key) = MethodKey::from_code(route.method_code) else {
+                continue;
+            };
+
+            match route.route_kind {
+                ROUTE_KIND_EXACT => {
+                    dynamic_exact_routes
+                        .entry(method_key)
+                        .or_insert_with(HashMap::new)
+                        .insert(
+                            Box::<[u8]>::from(path.as_bytes()),
+                            compile_dynamic_route_spec(route),
+                        );
+                }
+                ROUTE_KIND_PARAM => {
+                    let compiled = compile_param_route(route, path.as_str());
+                    dynamic_param_routes
+                        .entry(method_key)
+                        .or_insert_with(HashMap::new)
+                        .entry(route.segment_count)
+                        .or_insert_with(Vec::new)
+                        .push(compiled);
+                }
+                _ => {}
+            }
         }
 
         Ok(Self {
             exact_get_root,
-            dynamic_routes,
+            dynamic_exact_routes,
+            dynamic_param_routes,
             exact_static_routes,
         })
     }
 
-    pub fn match_route(&self, method: &str, path: &str) -> Option<MatchedRoute> {
-        let path_segments = split_path(path);
+    pub fn match_route<'a, 'b>(
+        &'a self,
+        method_code: u8,
+        path: &'b str,
+    ) -> Option<MatchedRoute<'a, 'b>> {
+        let method_key = MethodKey::from_code(method_code)?;
 
-        for route in &self.dynamic_routes {
-            if route.method != method {
-                continue;
-            }
+        if let Some(route_spec) = self
+            .dynamic_exact_routes
+            .get(&method_key)
+            .and_then(|routes| routes.get(path.as_bytes()))
+        {
+            return Some(MatchedRoute {
+                handler_id: route_spec.handler_id,
+                param_values: Vec::new(),
+                header_keys: route_spec.header_keys.as_ref(),
+                full_headers: route_spec.full_headers,
+            });
+        }
 
-            if route.segments.len() != path_segments.len() {
-                continue;
-            }
+        let path_segments = split_request_segments(path);
+        let param_routes = self
+            .dynamic_param_routes
+            .get(&method_key)
+            .and_then(|routes| routes.get(&(path_segments.len() as u16)))?;
 
-            let mut params = HashMap::new();
+        for route in param_routes {
+            let mut param_values = Vec::with_capacity(route.spec.param_names.len());
             let mut matched = true;
 
             for (segment, path_segment) in route.segments.iter().zip(path_segments.iter()) {
                 match segment {
-                    RouteSegment::Static(value) if value == path_segment => {}
-                    RouteSegment::Static(_) => {
+                    CompiledSegment::Static(value) if value.as_ref() == *path_segment => {}
+                    CompiledSegment::Static(_) => {
                         matched = false;
                         break;
                     }
-                    RouteSegment::Param(name) => {
-                        params.insert(name.clone(), path_segment.clone());
+                    CompiledSegment::Param => {
+                        param_values.push(*path_segment);
                     }
                 }
             }
 
             if matched {
                 return Some(MatchedRoute {
-                    handler_id: route.handler_id,
-                    params,
+                    handler_id: route.spec.handler_id,
+                    param_values,
+                    header_keys: route.spec.header_keys.as_ref(),
+                    full_headers: route.spec.full_headers,
                 });
             }
         }
@@ -180,22 +237,74 @@ impl MethodKey {
             _ => None,
         }
     }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Get),
+            2 => Some(Self::Post),
+            3 => Some(Self::Put),
+            4 => Some(Self::Delete),
+            5 => Some(Self::Patch),
+            6 => Some(Self::Options),
+            7 => Some(Self::Head),
+            _ => None,
+        }
+    }
 }
 
-fn split_path(path: &str) -> Vec<String> {
+fn compile_param_route(route: &RouteInput, path: &str) -> ParamRoute {
+    let segments = parse_segments(path)
+        .into_iter()
+        .map(|segment| match segment {
+            RouteSegment::Static(value) => CompiledSegment::Static(value.into_boxed_str()),
+            RouteSegment::Param(_) => CompiledSegment::Param,
+        })
+        .collect();
+
+    ParamRoute {
+        spec: compile_dynamic_route_spec(route),
+        segments,
+    }
+}
+
+fn compile_dynamic_route_spec(route: &RouteInput) -> DynamicRouteSpec {
+    let param_names = route
+        .param_names
+        .iter()
+        .map(|name| name.clone().into_boxed_str())
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let header_keys = route
+        .header_keys
+        .iter()
+        .map(|name| name.clone().into_boxed_str())
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+
+    DynamicRouteSpec {
+        handler_id: route.handler_id,
+        param_names,
+        header_keys,
+        full_headers: route.full_headers,
+    }
+}
+
+fn split_request_segments(path: &str) -> Vec<&str> {
     if path == "/" {
         return Vec::new();
     }
 
-    normalize_path(path)
-        .trim_start_matches('/')
+    path.trim_start_matches('/')
         .split('/')
         .filter(|segment| !segment.is_empty())
-        .map(ToOwned::to_owned)
         .collect()
 }
 
-fn build_keep_alive_response(status: u16, headers: &HashMap<String, String>, body: &[u8]) -> Vec<u8> {
+fn build_keep_alive_response(
+    status: u16,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> Vec<u8> {
     build_response_bytes(status, headers, body, true)
 }
 

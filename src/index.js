@@ -1,3 +1,14 @@
+import { Buffer } from "node:buffer";
+
+import {
+  analyzeRequestAccess,
+  compileRouteShape,
+  createJsonSerializer,
+  createRequestFactory,
+  decodeRequestEnvelope,
+  encodeResponseEnvelope,
+  mergeRequestAccessPlans,
+} from "./bridge.js";
 import { loadNativeModule } from "./native.js";
 import defaultHttpServerConfig, {
   normalizeHttpServerConfig,
@@ -6,6 +17,7 @@ import { createRuntimeOptimizer } from "../opt/runtime.js";
 
 const HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"];
 const ACTIVE_NATIVE_SERVERS = new Set();
+const EMPTY_BUFFER = Buffer.alloc(0);
 
 function normalizePathPrefix(path) {
   if (path === "/") {
@@ -32,11 +44,6 @@ function pathPrefixMatches(pathPrefix, requestPath) {
   return requestPath === pathPrefix || requestPath.startsWith(`${pathPrefix}/`);
 }
 
-function headerAccessor(headers, name) {
-  const key = String(name).toLowerCase();
-  return headers[key];
-}
-
 function normalizeContentType(type) {
   if (type.includes("/")) {
     return type;
@@ -57,11 +64,11 @@ function normalizeContentType(type) {
   return type;
 }
 
-function createResponseEnvelope() {
+function createResponseEnvelope(jsonSerializer = createJsonSerializer("fallback")) {
   const state = {
     status: 200,
     headers: {},
-    body: Buffer.alloc(0),
+    body: EMPTY_BUFFER,
     finished: false,
     locals: {},
   };
@@ -104,7 +111,7 @@ function createResponseEnvelope() {
         state.headers["content-type"] = "application/json; charset=utf-8";
       }
 
-      state.body = Buffer.from(JSON.stringify(data), "utf8");
+      state.body = jsonSerializer(data);
       state.finished = true;
       return response;
     },
@@ -118,14 +125,16 @@ function createResponseEnvelope() {
         if (!state.headers["content-type"]) {
           state.headers["content-type"] = "application/octet-stream";
         }
-        state.body = Buffer.from(data);
+        state.body = Buffer.isBuffer(data)
+          ? data
+          : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
       } else if (typeof data === "string") {
         if (!state.headers["content-type"]) {
           state.headers["content-type"] = "text/plain; charset=utf-8";
         }
         state.body = Buffer.from(data, "utf8");
       } else if (data === undefined || data === null) {
-        state.body = Buffer.alloc(0);
+        state.body = EMPTY_BUFFER;
       } else {
         return response.json(data);
       }
@@ -149,98 +158,82 @@ function createResponseEnvelope() {
       return {
         status: state.status,
         headers: state.headers,
-        bodyBase64: state.body.toString("base64"),
+        body: state.body,
       };
     },
   };
 }
 
-async function runMiddlewares(middlewares, req, res) {
-  const matchedMiddlewares = middlewares.filter((middleware) =>
-    pathPrefixMatches(middleware.pathPrefix, req.path),
-  );
+function createMiddlewareRunner(middlewares) {
+  return async function runCompiledMiddlewares(req, res) {
+    let index = -1;
 
-  let index = -1;
+    async function dispatch(position) {
+      if (position <= index) {
+        throw new Error("Middleware next() called multiple times");
+      }
 
-  async function dispatch(position) {
-    if (position <= index) {
-      throw new Error("Middleware next() called multiple times");
+      index = position;
+      const middleware = middlewares[position];
+      if (!middleware || res.finished) {
+        return;
+      }
+
+      if (middleware.handler.length >= 3) {
+        await middleware.handler(req, res, () => dispatch(position + 1));
+        return;
+      }
+
+      await middleware.handler(req, res);
+      if (!res.finished) {
+        await dispatch(position + 1);
+      }
     }
 
-    index = position;
-    const middleware = matchedMiddlewares[position];
-    if (!middleware || res.finished) {
-      return;
-    }
-
-    if (middleware.handler.length >= 3) {
-      await middleware.handler(req, res, () => dispatch(position + 1));
-      return;
-    }
-
-    await middleware.handler(req, res);
-    if (!res.finished) {
-      await dispatch(position + 1);
-    }
-  }
-
-  await dispatch(0);
-}
-
-function buildRequest(request) {
-  return {
-    method: request.method,
-    path: request.path,
-    url: request.url,
-    params: request.params ?? {},
-    query: request.query ?? {},
-    headers: request.headers ?? {},
-    header(name) {
-      return headerAccessor(request.headers ?? {}, name);
-    },
+    await dispatch(0);
   };
 }
 
 function serializeErrorResponse(error) {
-  return JSON.stringify({
+  return encodeResponseEnvelope({
     status: 500,
     headers: {
       "content-type": "application/json; charset=utf-8",
     },
-    bodyBase64: Buffer.from(
+    body: Buffer.from(
       JSON.stringify({
         error: "Internal Server Error",
         detail: error instanceof Error ? error.message : String(error),
       }),
       "utf8",
-    ).toString("base64"),
+    ),
   });
 }
 
-function createDispatcher(routes, middlewares, runtimeOptimizer) {
-  const routesById = new Map(routes.map((route) => [route.handlerId, route]));
+function createDispatcher(compiledRoutes, runtimeOptimizer) {
+  const routesById = new Map(compiledRoutes.map((route) => [route.handlerId, route]));
 
-  return async function dispatch(requestJson) {
-    let parsed;
+  return async function dispatch(requestBuffer) {
+    let decoded;
 
     try {
-      parsed = JSON.parse(requestJson);
+      decoded = decodeRequestEnvelope(requestBuffer);
     } catch (error) {
       return serializeErrorResponse(error);
     }
 
-    const route = routesById.get(parsed.handlerId);
+    const route = routesById.get(decoded.handlerId);
     if (!route) {
-      return serializeErrorResponse(new Error(`Unknown handler id ${parsed.handlerId}`));
+      return serializeErrorResponse(new Error(`Unknown handler id ${decoded.handlerId}`));
     }
 
-    const req = buildRequest(parsed);
-    const { response: res, snapshot } = createResponseEnvelope();
+    const req = route.requestFactory(decoded);
+    const { response: res, snapshot } = createResponseEnvelope(route.jsonSerializer);
 
     try {
-      await runMiddlewares(middlewares, req, res);
+      await route.runMiddlewares(req, res);
       if (!res.finished) {
-        await route.handler(req, res);
+        await route.compiledHandler(req, res);
       }
     } catch (error) {
       if (!res.finished) {
@@ -250,7 +243,7 @@ function createDispatcher(routes, middlewares, runtimeOptimizer) {
 
     const responseSnapshot = snapshot();
     runtimeOptimizer?.recordDispatch(route, req, responseSnapshot);
-    return JSON.stringify(responseSnapshot);
+    return encodeResponseEnvelope(responseSnapshot);
   };
 }
 
@@ -263,6 +256,50 @@ function normalizeRouteRegistration(method, path, handler) {
     method,
     path: normalizeRoutePath(method, path),
     handler,
+  };
+}
+
+function compileMiddlewareRegistration(middleware) {
+  const handlerSource = Function.prototype.toString.call(middleware.handler);
+
+  return {
+    ...middleware,
+    handlerSource,
+    accessPlan: analyzeRequestAccess(handlerSource),
+  };
+}
+
+function compileRouteDispatch(route, middlewares) {
+  const applicableMiddlewares = middlewares.filter((middleware) =>
+    pathPrefixMatches(middleware.pathPrefix, route.path),
+  );
+  const requestPlan = mergeRequestAccessPlans([
+    route.accessPlan,
+    ...applicableMiddlewares.map((middleware) => middleware.accessPlan),
+  ]);
+
+  const requestFactory = createRequestFactory(
+    requestPlan,
+    route.paramNames,
+    route.method,
+  );
+  const runMiddlewares = createMiddlewareRunner(applicableMiddlewares);
+  const compiledHandler = route.handler;
+  const jsonFastPath =
+    route.accessPlan.jsonFastPath === "fallback"
+      ? requestPlan.jsonFastPath
+      : route.accessPlan.jsonFastPath;
+
+  return {
+    ...route,
+    applicableMiddlewares,
+    requestPlan,
+    requestFactory,
+    runMiddlewares,
+    compiledHandler,
+    dispatchKind: requestPlan.dispatchKind,
+    jsonFastPath,
+    jsonSerializer: createJsonSerializer(jsonFastPath),
   };
 }
 
@@ -332,33 +369,49 @@ export function createApp() {
 
     async listen(options = {}) {
       const normalizedOptions = normalizeListenOptions(options);
+      const compiledMiddlewares = this._middlewares.map(compileMiddlewareRegistration);
 
-      const routes = this._routes.map((route) => ({
+      const routes = this._routes.map((route) => {
+        const handlerSource = Function.prototype.toString.call(route.handler);
+
+        return {
         ...route,
         handlerId: nextHandlerId++,
-        handlerSource: Function.prototype.toString.call(route.handler),
-      }));
+        handlerSource,
+        accessPlan: analyzeRequestAccess(handlerSource),
+        ...compileRouteShape(route.method, route.path),
+        };
+      });
+      const compiledRoutes = routes.map((route) =>
+        compileRouteDispatch(route, compiledMiddlewares),
+      );
 
       const manifest = {
         version: 1,
         serverConfig: normalizedOptions.serverConfig,
-        middlewares: this._middlewares.map((middleware) => ({
+        middlewares: compiledMiddlewares.map((middleware) => ({
           pathPrefix: middleware.pathPrefix,
         })),
-        routes: routes.map((route) => ({
+        routes: compiledRoutes.map((route) => ({
           method: route.method,
+          methodCode: route.methodCode,
           path: route.path,
+          routeKind: route.routeKind,
           handlerId: route.handlerId,
           handlerSource: route.handlerSource,
+          paramNames: route.paramNames,
+          segmentCount: route.segmentCount,
+          headerKeys: [...route.requestPlan.headerKeys],
+          fullHeaders: route.requestPlan.fullHeaders,
         })),
       };
 
       const runtimeOptimizer = createRuntimeOptimizer(
-        routes,
-        this._middlewares,
+        compiledRoutes,
+        compiledMiddlewares,
         normalizedOptions.opt,
       );
-      const dispatcher = createDispatcher(routes, this._middlewares, runtimeOptimizer);
+      const dispatcher = createDispatcher(compiledRoutes, runtimeOptimizer);
       const handle = native.startServer(JSON.stringify(manifest), dispatcher, {
         host: normalizedOptions.host,
         port: normalizedOptions.port,

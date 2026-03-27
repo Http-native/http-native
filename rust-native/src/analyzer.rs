@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use crate::manifest::{MiddlewareInput, RouteInput};
 
 /// Optimize static stuff
-/// Its not very fun but we don't need to call js again and again for 
+/// Its not very fun but we don't need to call js again and again for
 /// static responses, we can just return them from rust
 
 #[derive(Clone)]
@@ -15,7 +15,7 @@ pub struct StaticResponseSpec {
 }
 
 pub enum AnalysisResult {
-    ExactNativeStaticHot(StaticResponseSpec),
+    ExactStaticFastPath(StaticResponseSpec),
     Dynamic,
 }
 
@@ -40,25 +40,25 @@ pub fn analyze_route(route: &RouteInput, middlewares: &[MiddlewareInput]) -> Ana
 
     if let Some((status, payload)) = parse_status_call(body, "json") {
         if let Some(spec) = build_json_response(status, payload) {
-            return AnalysisResult::ExactNativeStaticHot(spec);
+            return AnalysisResult::ExactStaticFastPath(spec);
         }
     }
 
     if let Some((status, payload)) = parse_status_call(body, "send") {
         if let Some(spec) = build_send_response(status, payload) {
-            return AnalysisResult::ExactNativeStaticHot(spec);
+            return AnalysisResult::ExactStaticFastPath(spec);
         }
     }
 
     if let Some(payload) = strip_call(body, "res.json(") {
         if let Some(spec) = build_json_response(200, payload) {
-            return AnalysisResult::ExactNativeStaticHot(spec);
+            return AnalysisResult::ExactStaticFastPath(spec);
         }
     }
 
     if let Some(payload) = strip_call(body, "res.send(") {
         if let Some(spec) = build_send_response(200, payload) {
-            return AnalysisResult::ExactNativeStaticHot(spec);
+            return AnalysisResult::ExactStaticFastPath(spec);
         }
     }
 
@@ -88,8 +88,8 @@ pub fn parse_segments(path: &str) -> Vec<RouteSegment> {
         .split('/')
         .filter(|segment| !segment.is_empty())
         .map(|segment| {
-            if let Some(name) = segment.strip_prefix(':') {
-                RouteSegment::Param(name.to_string())
+            if segment.strip_prefix(':').is_some() {
+                RouteSegment::Param(())
             } else {
                 RouteSegment::Static(segment.to_string())
             }
@@ -100,7 +100,7 @@ pub fn parse_segments(path: &str) -> Vec<RouteSegment> {
 #[derive(Clone)]
 pub enum RouteSegment {
     Static(String),
-    Param(String),
+    Param(()),
 }
 
 fn has_applicable_middleware(route_path: &str, middlewares: &[MiddlewareInput]) -> bool {
@@ -184,7 +184,11 @@ fn build_json_response(status: u16, payload: &str) -> Option<StaticResponseSpec>
         "application/json; charset=utf-8".to_string(),
     );
 
-    Some(StaticResponseSpec { status, headers, body })
+    Some(StaticResponseSpec {
+        status,
+        headers,
+        body,
+    })
 }
 
 fn build_send_response(status: u16, payload: &str) -> Option<StaticResponseSpec> {
@@ -211,11 +215,64 @@ fn build_send_response(status: u16, payload: &str) -> Option<StaticResponseSpec>
                 "application/json; charset=utf-8".to_string(),
             );
 
-            Some(StaticResponseSpec { status, headers, body })
+            Some(StaticResponseSpec {
+                status,
+                headers,
+                body,
+            })
         }
     }
 }
 
 fn parse_literal(source: &str) -> Option<Value> {
-    json5::from_str::<Value>(source).ok()
+    let normalized = normalize_js_literal(source);
+    json5::from_str::<Value>(normalized.as_str()).ok()
+}
+
+fn normalize_js_literal(source: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    let mut string_delimiter = None;
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if let Some(delimiter) = string_delimiter {
+            output.push(ch);
+            if escaped {
+                escaped = false;
+                continue;
+            }
+
+            if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                string_delimiter = None;
+            }
+            continue;
+        }
+
+        if matches!(ch, '"' | '\'' | '`') {
+            string_delimiter = Some(ch);
+            output.push(ch);
+            continue;
+        }
+
+        if ch == '!' {
+            if matches!(chars.peek(), Some('0')) {
+                chars.next();
+                output.push_str("true");
+                continue;
+            }
+
+            if matches!(chars.peek(), Some('1')) {
+                chars.next();
+                output.push_str("false");
+                continue;
+            }
+        }
+
+        output.push(ch);
+    }
+
+    output
 }
