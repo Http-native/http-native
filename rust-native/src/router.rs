@@ -9,6 +9,7 @@ use crate::manifest::{ManifestInput, RouteInput};
 
 const ROUTE_KIND_EXACT: u8 = 1;
 const ROUTE_KIND_PARAM: u8 = 2;
+const MAX_STACK_SEGMENTS: usize = 16;
 
 // ─── Public Types ─────────────────────────────────────────────────────────────
 
@@ -271,10 +272,16 @@ impl Router {
         }
 
         // Radix tree match (O(M) where M = segment count)
-        let segments = split_request_segments(path);
         let tree = self.radix_trees.get(&method_key)?;
-        let mut param_values = Vec::new();
-        let spec = tree.match_path(&segments, &mut param_values)?;
+        let mut seg_buf = [""; MAX_STACK_SEGMENTS];
+        let seg_count = split_segments_stack(path, &mut seg_buf);
+        let mut param_values = Vec::with_capacity(4);
+        let spec = if seg_count <= MAX_STACK_SEGMENTS {
+            tree.match_path(&seg_buf[..seg_count], &mut param_values)?
+        } else {
+            let segments = split_request_segments(path);
+            tree.match_path(&segments, &mut param_values)?
+        };
 
         Some(MatchedRoute {
             handler_id: spec.handler_id,
@@ -376,6 +383,27 @@ fn split_request_segments(path: &str) -> Vec<&str> {
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect()
+}
+
+/// Stack-allocated segment splitting — avoids heap Vec for paths with ≤ MAX_STACK_SEGMENTS segments.
+/// Returns the number of segments written into `buf`. If the path has more segments than `buf.len()`,
+/// returns `buf.len() + 1` as an overflow sentinel.
+fn split_segments_stack<'a>(path: &'a str, buf: &mut [&'a str]) -> usize {
+    if path == "/" {
+        return 0;
+    }
+    let mut count = 0;
+    for segment in path.trim_start_matches('/').split('/') {
+        if segment.is_empty() {
+            continue;
+        }
+        if count >= buf.len() {
+            return count + 1; // overflow sentinel
+        }
+        buf[count] = segment;
+        count += 1;
+    }
+    count
 }
 
 fn build_keep_alive_response(

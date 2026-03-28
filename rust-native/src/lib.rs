@@ -34,8 +34,9 @@ const FALLBACK_HEADER_TRANSFER_ENCODING_PREFIX: &str = "transfer-encoding:";
 const BRIDGE_VERSION: u8 = 1;
 const REQUEST_FLAG_QUERY_PRESENT: u16 = 1 << 0;
 const REQUEST_FLAG_BODY_PRESENT: u16 = 1 << 1;
-const NOT_FOUND_HANDLER_ID: u32 = 0;
-const NOT_FOUND_BODY: &[u8] = br#"{"error":"Route not found"}"#;
+// Pre-built 404 responses — zero allocation per request
+const NOT_FOUND_RESPONSE_KEEP_ALIVE: &[u8] = b"HTTP/1.1 404 Not Found\r\ncontent-length: 27\r\nconnection: keep-alive\r\ncontent-type: application/json; charset=utf-8\r\n\r\n{\"error\":\"Route not found\"}";
+const NOT_FOUND_RESPONSE_CLOSE: &[u8] = b"HTTP/1.1 404 Not Found\r\ncontent-length: 27\r\nconnection: close\r\ncontent-type: application/json; charset=utf-8\r\n\r\n{\"error\":\"Route not found\"}";
 
 /// Security: Maximum number of headers we allow per request
 const MAX_HEADER_COUNT: usize = 64;
@@ -522,22 +523,11 @@ async fn handle_connection_inner(
         let has_body = parsed.has_body;
         let content_length = parsed.content_length;
 
-        // Extract owned copies from parsed (which borrows buffer) before we mutate buffer
-        let method_owned: Vec<u8> = parsed.method.to_vec();
-        let target_owned: Vec<u8> = parsed.target.to_vec();
-        let path_owned: Vec<u8> = parsed.path.to_vec();
-        let headers_owned: Vec<(String, String)> = parsed
-            .headers
-            .iter()
-            .map(|(n, v)| (n.to_string(), v.to_string()))
-            .collect();
-
-        drop(parsed);
-
-        // ── Fast path: static routes (GET /) ──
-        if !has_body && method_owned == b"GET" {
-            if path_owned == b"/" {
+        // ── Fast path: static routes (zero-copy from borrowed parse data) ──
+        if !has_body && parsed.method == b"GET" {
+            if parsed.path == b"/" {
                 if let Some(static_route) = router.exact_get_root() {
+                    drop(parsed);
                     drain_consumed_bytes(buffer, header_bytes);
                     write_exact_static_response(stream, static_route, keep_alive).await?;
                     if !keep_alive {
@@ -547,7 +537,8 @@ async fn handle_connection_inner(
                     continue;
                 }
             }
-            if let Some(static_route) = router.exact_static_route(&method_owned, &path_owned) {
+            if let Some(static_route) = router.exact_static_route(parsed.method, parsed.path) {
+                drop(parsed);
                 drain_consumed_bytes(buffer, header_bytes);
                 write_exact_static_response(stream, static_route, keep_alive).await?;
                 if !keep_alive {
@@ -558,12 +549,48 @@ async fn handle_connection_inner(
             }
         }
 
-        // ── Read request body if present ──────────────────────────────
-        let body_bytes: Vec<u8> = if has_body {
+        // ── Zero-copy path: non-body requests ──
+        // Build dispatch envelope directly from borrowed parse data, avoiding
+        // String/Vec allocations for method, target, path, and headers.
+        if !has_body {
+            let dispatch_request =
+                build_dispatch_request_zero_copy(router, &parsed, &[])?;
+            drop(parsed);
+            drain_consumed_bytes(buffer, header_bytes);
+
+            match dispatch_request {
+                Some(request) => {
+                    write_dynamic_dispatch_response(stream, dispatcher, request, keep_alive)
+                        .await?;
+                }
+                None => {
+                    write_not_found_response(stream, keep_alive).await?;
+                }
+            }
+
+            if !keep_alive {
+                stream.shutdown().await?;
+                return Ok(());
+            }
+            continue;
+        }
+
+        // ── Body requests: need owned copies to release buffer for body read ──
+        let method_owned: Vec<u8> = parsed.method.to_vec();
+        let target_owned: Vec<u8> = parsed.target.to_vec();
+        let path_owned: Vec<u8> = parsed.path.to_vec();
+        let headers_owned: Vec<(String, String)> = parsed
+            .headers
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect();
+        drop(parsed);
+
+        // ── Read request body ──────────────────────────────────────
+        let body_bytes: Vec<u8> = {
             let content_length = match content_length {
                 Some(len) => len,
                 None => {
-                    // Chunked or unknown body length — reject for now
                     let response =
                         build_error_response_bytes(411, b"{\"error\":\"Length Required\"}", false);
                     let (write_result, _) = stream.write_all(response).await;
@@ -573,7 +600,6 @@ async fn handle_connection_inner(
                 }
             };
 
-            // Security: enforce max body size
             if content_length > MAX_BODY_BYTES {
                 let response =
                     build_error_response_bytes(413, b"{\"error\":\"Payload Too Large\"}", false);
@@ -583,7 +609,6 @@ async fn handle_connection_inner(
                 return Ok(());
             }
 
-            // Some body bytes may already be in the buffer after the headers
             let already_in_buffer = if buffer.len() > header_bytes {
                 buffer.len() - header_bytes
             } else {
@@ -591,12 +616,10 @@ async fn handle_connection_inner(
             };
 
             if already_in_buffer >= content_length {
-                // Entire body is already in the buffer
                 let body = buffer[header_bytes..header_bytes + content_length].to_vec();
                 drain_consumed_bytes(buffer, header_bytes + content_length);
                 body
             } else {
-                // Need to read more bytes from the stream
                 let mut body = Vec::with_capacity(content_length);
                 if already_in_buffer > 0 {
                     body.extend_from_slice(&buffer[header_bytes..]);
@@ -609,19 +632,15 @@ async fn handle_connection_inner(
                     let (read_result, returned_buf) = stream.read(chunk_buf).await;
                     let bytes_read = read_result?;
                     if bytes_read == 0 {
-                        return Ok(()); // Connection closed mid-body
+                        return Ok(());
                     }
                     body.extend_from_slice(&returned_buf[..bytes_read]);
                 }
                 body.truncate(content_length);
                 body
             }
-        } else {
-            drain_consumed_bytes(buffer, header_bytes);
-            Vec::new()
         };
 
-        // Dynamic path: build bridge envelope and dispatch to JS
         let dispatch_request = build_dispatch_request_owned(
             router,
             &method_owned,
@@ -821,6 +840,47 @@ fn parse_hot_root_request(
 // ─── Bridge Envelope Building (Single-Pass Headers) ───────────────────────────
 //
 // Uses the pre-parsed headers from httparse — no second scan of the raw bytes.
+
+/// Zero-copy dispatch: builds the bridge envelope directly from borrowed parse data,
+/// avoiding all String/Vec allocations for method, target, path, and headers.
+/// Used for non-body requests (GET, DELETE without body, etc.).
+fn build_dispatch_request_zero_copy(
+    router: &Router,
+    parsed: &ParsedRequest<'_>,
+    body: &[u8],
+) -> Result<Option<Buffer>> {
+    let Some(method_code) = method_code_from_bytes(parsed.method) else {
+        return Ok(None);
+    };
+
+    let path_str = match std::str::from_utf8(parsed.path) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+    let url_str = match std::str::from_utf8(parsed.target) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+
+    let normalized_path = normalize_runtime_path(path_str);
+    if contains_path_traversal(&normalized_path) {
+        return Ok(None);
+    }
+
+    let Some(matched_route) = router.match_route(method_code, normalized_path.as_ref()) else {
+        return Ok(None);
+    };
+
+    build_dispatch_envelope(
+        &matched_route,
+        method_code,
+        path_str,
+        url_str,
+        &parsed.headers,
+        body,
+    )
+    .map(Some)
+}
 
 fn build_dispatch_request_owned(
     router: &Router,
@@ -1030,59 +1090,125 @@ async fn write_exact_static_response(
     Ok(())
 }
 
-#[derive(Clone)]
-struct DispatchResponseEnvelope {
-    status: u16,
-    headers: Vec<(String, String)>,
-    body: Bytes,
-}
-
 async fn write_dynamic_dispatch_response(
     stream: &mut TcpStream,
     dispatcher: &JsDispatcher,
     request: Buffer,
     keep_alive: bool,
 ) -> Result<()> {
-    let parsed = match dispatcher.dispatch(request).await {
-        Ok(response) => match parse_dispatch_response(response.as_ref()) {
-            Ok(parsed) => parsed,
-            Err(_) => DispatchResponseEnvelope {
-                status: 500,
-                headers: vec![(
-                    "content-type".to_string(),
-                    "application/json; charset=utf-8".to_string(),
-                )],
-                // Security: sanitized error — no internal details
-                body: Bytes::from_static(b"{\"error\":\"Internal Server Error\"}"),
-            },
-        },
-        Err(_) => DispatchResponseEnvelope {
-            status: 502,
-            headers: vec![(
-                "content-type".to_string(),
-                "application/json; charset=utf-8".to_string(),
-            )],
+    match dispatcher.dispatch(request).await {
+        Ok(response) => {
+            match build_http_response_from_dispatch(response.as_ref(), keep_alive) {
+                Ok(http_response) => {
+                    let (write_result, _) = stream.write_all(http_response).await;
+                    write_result?;
+                }
+                Err(_) => {
+                    // Security: sanitized error — no internal details
+                    let response = build_error_response_bytes(
+                        500,
+                        b"{\"error\":\"Internal Server Error\"}",
+                        keep_alive,
+                    );
+                    let (write_result, _) = stream.write_all(response).await;
+                    write_result?;
+                }
+            }
+        }
+        Err(_) => {
             // Security: sanitized error — no internal details
-            body: Bytes::from_static(b"{\"error\":\"Bad Gateway\"}"),
-        },
-    };
-
-    let response_bytes = build_dispatch_response_bytes(parsed, keep_alive);
-    let (write_result, _) = stream.write_all(response_bytes).await;
-    write_result?;
+            let response = build_error_response_bytes(
+                502,
+                b"{\"error\":\"Bad Gateway\"}",
+                keep_alive,
+            );
+            let (write_result, _) = stream.write_all(response).await;
+            write_result?;
+        }
+    }
     Ok(())
 }
 
+/// Build HTTP response bytes directly from the binary dispatch envelope,
+/// avoiding all intermediate String/Bytes allocations.
+fn build_http_response_from_dispatch(dispatch_bytes: &[u8], keep_alive: bool) -> Result<Vec<u8>> {
+    let mut offset = 0usize;
+    let status = read_u16(dispatch_bytes, &mut offset)?;
+    let header_count = read_u16(dispatch_bytes, &mut offset)? as usize;
+    let body_length = read_u32(dispatch_bytes, &mut offset)? as usize;
+
+    let reason = status_reason(status);
+    let connection = if keep_alive { "keep-alive" } else { "close" };
+
+    // Conservative estimate: framing overhead + all dispatch bytes
+    let mut output = Vec::with_capacity(dispatch_bytes.len() + 128);
+
+    // Status line
+    output.extend_from_slice(b"HTTP/1.1 ");
+    write_u16(&mut output, status);
+    output.push(b' ');
+    output.extend_from_slice(reason.as_bytes());
+    output.extend_from_slice(b"\r\n");
+
+    // Mandatory headers
+    output.extend_from_slice(b"content-length: ");
+    write_usize(&mut output, body_length);
+    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(b"connection: ");
+    output.extend_from_slice(connection.as_bytes());
+    output.extend_from_slice(b"\r\n");
+
+    // User headers — read directly from binary without String allocation
+    for _ in 0..header_count {
+        let name_len = read_u8(dispatch_bytes, &mut offset)? as usize;
+        let value_len = read_u16(dispatch_bytes, &mut offset)? as usize;
+
+        if offset + name_len + value_len > dispatch_bytes.len() {
+            return Err(anyhow!("response envelope truncated"));
+        }
+
+        let name_bytes = &dispatch_bytes[offset..offset + name_len];
+        offset += name_len;
+        let value_bytes = &dispatch_bytes[offset..offset + value_len];
+        offset += value_len;
+
+        // Skip headers we already wrote
+        if name_bytes.eq_ignore_ascii_case(b"content-length")
+            || name_bytes.eq_ignore_ascii_case(b"connection")
+        {
+            continue;
+        }
+
+        // Security: CRLF injection check
+        if name_bytes.iter().any(|&b| b == b'\r' || b == b'\n')
+            || value_bytes.iter().any(|&b| b == b'\r' || b == b'\n')
+        {
+            continue;
+        }
+
+        output.extend_from_slice(name_bytes);
+        output.extend_from_slice(b": ");
+        output.extend_from_slice(value_bytes);
+        output.extend_from_slice(b"\r\n");
+    }
+
+    output.extend_from_slice(b"\r\n");
+
+    // Body
+    if offset + body_length > dispatch_bytes.len() {
+        return Err(anyhow!("response body truncated"));
+    }
+    output.extend_from_slice(&dispatch_bytes[offset..offset + body_length]);
+
+    Ok(output)
+}
+
 async fn write_not_found_response(stream: &mut TcpStream, keep_alive: bool) -> Result<()> {
-    let response = build_response_bytes(
-        404,
-        &[(
-            "content-type".to_string(),
-            "application/json; charset=utf-8".to_string(),
-        )],
-        Bytes::from_static(NOT_FOUND_BODY),
-        keep_alive,
-    );
+    let response = if keep_alive {
+        Bytes::from_static(NOT_FOUND_RESPONSE_KEEP_ALIVE)
+    } else {
+        Bytes::from_static(NOT_FOUND_RESPONSE_CLOSE)
+    };
     let (write_result, _) = stream.write_all(response).await;
     write_result?;
     Ok(())
@@ -1097,15 +1223,6 @@ fn build_error_response_bytes(status: u16, body: &[u8], keep_alive: bool) -> Vec
             "application/json; charset=utf-8".to_string(),
         )],
         Bytes::copy_from_slice(body),
-        keep_alive,
-    )
-}
-
-fn build_dispatch_response_bytes(response: DispatchResponseEnvelope, keep_alive: bool) -> Vec<u8> {
-    build_response_bytes(
-        response.status,
-        &response.headers,
-        response.body,
         keep_alive,
     )
 }
@@ -1181,35 +1298,6 @@ fn build_response_bytes(
     output.extend_from_slice(b"\r\n");
     output.extend_from_slice(body.as_ref());
     output
-}
-
-// ─── Response Parsing (from JS bridge) ────────────────────────────────────────
-
-fn parse_dispatch_response(bytes: &[u8]) -> Result<DispatchResponseEnvelope> {
-    let mut offset = 0;
-    let status = read_u16(bytes, &mut offset)?;
-    let header_count = read_u16(bytes, &mut offset)? as usize;
-    let body_length = read_u32(bytes, &mut offset)? as usize;
-
-    let mut headers = Vec::with_capacity(header_count);
-    for _ in 0..header_count {
-        let name_length = read_u8(bytes, &mut offset)? as usize;
-        let value_length = read_u16(bytes, &mut offset)? as usize;
-        let name = read_utf8(bytes, &mut offset, name_length)?;
-        let value = read_utf8(bytes, &mut offset, value_length)?;
-        headers.push((name, value));
-    }
-
-    if offset + body_length > bytes.len() {
-        return Err(anyhow!("response body truncated"));
-    }
-
-    let body = Bytes::copy_from_slice(&bytes[offset..offset + body_length]);
-    Ok(DispatchResponseEnvelope {
-        status,
-        headers,
-        body,
-    })
 }
 
 // ─── Security Utilities ───────────────────────────────────────────────────────
@@ -1463,18 +1551,6 @@ fn read_u32(bytes: &[u8], offset: &mut usize) -> Result<u32> {
         bytes[*offset + 3],
     ]);
     *offset += 4;
-    Ok(value)
-}
-
-fn read_utf8(bytes: &[u8], offset: &mut usize, length: usize) -> Result<String> {
-    if *offset + length > bytes.len() {
-        return Err(anyhow!("response envelope truncated"));
-    }
-
-    let value = std::str::from_utf8(&bytes[*offset..*offset + length])
-        .context("response envelope contained invalid utf-8")?
-        .to_string();
-    *offset += length;
     Ok(value)
 }
 

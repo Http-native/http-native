@@ -1,6 +1,9 @@
 import { Buffer } from "node:buffer";
 
-// ─── Core Types ───────────────────────────────────────────────────────────────
+// Types by rishi
+// Just simple types for now, we can expand as needed. The main goal is to provide a good developer 
+// experience with TypeScript and IDEs, 
+// so we want to be careful about adding too much complexity here.
 
 export interface Request {
   /** HTTP method (GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD) */

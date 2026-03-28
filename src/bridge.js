@@ -502,43 +502,63 @@ export function decodeRequestEnvelope(buffer) {
   };
 }
 
+// Header name encoding cache — avoids re-encoding common names like "content-type"
+const headerNameCache = new Map();
+
+function getCachedHeaderNameBytes(name) {
+  let bytes = headerNameCache.get(name);
+  if (bytes === undefined) {
+    bytes = textEncoder.encode(name);
+    if (headerNameCache.size < 64) {
+      headerNameCache.set(name, bytes);
+    }
+  }
+  return bytes;
+}
+
 export function encodeResponseEnvelope(snapshot) {
-  const headers = Object.entries(snapshot.headers ?? {}).map(([name, value]) => [
-    encodeUtf8(name),
-    encodeUtf8(String(value)),
-  ]);
+  const rawHeaders = snapshot.headers;
   const body = Buffer.isBuffer(snapshot.body)
     ? snapshot.body
     : snapshot.body instanceof Uint8Array
       ? Buffer.from(snapshot.body)
       : Buffer.alloc(0);
 
-  let totalLength = 2 + 2 + 4 + body.length;
-  for (const [nameBytes, valueBytes] of headers) {
+  // Encode headers inline — avoids Object.entries().map() intermediate arrays
+  const headerKeys = rawHeaders ? Object.keys(rawHeaders) : EMPTY_ARRAY;
+  const headerCount = headerKeys.length;
+  const encodedHeaders = new Array(headerCount);
+  let totalLength = 8 + body.length; // status(2) + count(2) + bodylen(4) + body
+
+  for (let i = 0; i < headerCount; i++) {
+    const name = headerKeys[i];
+    const nameBytes = getCachedHeaderNameBytes(name);
+    const valueBytes = textEncoder.encode(String(rawHeaders[name]));
     if (nameBytes.length > 0xff) {
       throw new Error(`Response header name too long: ${nameBytes.length}`);
     }
     if (valueBytes.length > 0xffff) {
       throw new Error(`Response header value too long: ${valueBytes.length}`);
     }
-    totalLength += 1 + 2 + nameBytes.length + valueBytes.length;
+    encodedHeaders[i] = [nameBytes, valueBytes];
+    totalLength += 3 + nameBytes.length + valueBytes.length;
   }
 
   const output = Buffer.allocUnsafe(totalLength);
   const view = new DataView(output.buffer, output.byteOffset, output.byteLength);
   let offset = 0;
 
-  writeU16(view, offset, Number(snapshot.status ?? 200));
+  view.setUint16(offset, Number(snapshot.status ?? 200), true);
   offset += 2;
-  writeU16(view, offset, headers.length);
+  view.setUint16(offset, headerCount, true);
   offset += 2;
-  writeU32(view, offset, body.length);
+  view.setUint32(offset, body.length, true);
   offset += 4;
 
-  for (const [nameBytes, valueBytes] of headers) {
-    writeU8(view, offset, nameBytes.length);
-    offset += 1;
-    writeU16(view, offset, valueBytes.length);
+  for (let i = 0; i < headerCount; i++) {
+    const [nameBytes, valueBytes] = encodedHeaders[i];
+    output[offset++] = nameBytes.length;
+    view.setUint16(offset, valueBytes.length, true);
     offset += 2;
     output.set(nameBytes, offset);
     offset += nameBytes.length;
