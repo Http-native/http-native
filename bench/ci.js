@@ -80,6 +80,7 @@ async function main() {
   console.log(summary);
   console.log(`[http-native][bench] wrote ${jsonPath}`);
   console.log(`[http-native][bench] wrote ${markdownPath}`);
+  process.exit(0);
 }
 
 function parseArgs(argv) {
@@ -214,10 +215,8 @@ async function runBenchmarkCase(testCase, options) {
   const server = spawnServer(testCase);
   const serverLogs = [];
   let readyResolve;
-  let readyReject;
-  const ready = new Promise((resolve, reject) => {
+  const ready = new Promise((resolve) => {
     readyResolve = resolve;
-    readyReject = reject;
   });
 
   let stdoutBuffer = "";
@@ -305,10 +304,7 @@ async function runBenchmarkCase(testCase, options) {
       derived: deriveMetrics(parsed.result),
     };
   } finally {
-    if (server.exitCode === null) {
-      server.kill("SIGTERM");
-      await once(server, "exit").catch(() => {});
-    }
+    await stopServer(server, `${testCase.engine}/${testCase.scenario}`);
   }
 }
 
@@ -316,6 +312,7 @@ function spawnServer(testCase) {
   if (testCase.engine === "bun" || testCase.engine === "http-native" || testCase.engine === "old") {
     return spawn("bun", ["bench/target.js", testCase.engine, testCase.scenario, String(testCase.port)], {
       cwd: process.cwd(),
+      detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
     });
   }
@@ -328,6 +325,7 @@ function spawnServer(testCase) {
 
     return spawn("go", ["run", ".", testCase.scenario, String(testCase.port)], {
       cwd,
+      detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
     });
   }
@@ -359,12 +357,70 @@ function spawnServer(testCase) {
       ["run", "--release", "--manifest-path", manifestPath, "--", testCase.scenario, String(testCase.port)],
       {
         cwd: process.cwd(),
+        detached: process.platform !== "win32",
         stdio: ["ignore", "pipe", "pipe"],
       },
     );
   }
 
   throw new Error(`Unsupported engine ${testCase.engine}`);
+}
+
+async function stopServer(server, label) {
+  if (!server) {
+    return;
+  }
+
+  if (server.exitCode !== null) {
+    cleanupServerStreams(server);
+    return;
+  }
+
+  const waitForExit = once(server, "exit");
+  const gracefulSignal = "SIGTERM";
+
+  try {
+    if (server.pid && process.platform !== "win32") {
+      process.kill(-server.pid, gracefulSignal);
+    } else {
+      server.kill(gracefulSignal);
+    }
+  } catch {
+    cleanupServerStreams(server);
+    return;
+  }
+
+  const gracefulExit = await Promise.race([
+    waitForExit.then(() => true).catch(() => false),
+    delay(5000).then(() => false),
+  ]);
+
+  if (!gracefulExit && server.exitCode === null) {
+    console.warn(`[http-native][bench] forcing ${label} to exit`);
+    try {
+      if (server.pid && process.platform !== "win32") {
+        process.kill(-server.pid, "SIGKILL");
+      } else {
+        server.kill("SIGKILL");
+      }
+      await once(server, "exit").catch(() => {});
+    } catch {
+      // Ignore kill failures during cleanup
+    }
+  }
+
+  cleanupServerStreams(server);
+}
+
+function cleanupServerStreams(server) {
+  server.stdout?.destroy();
+  server.stderr?.destroy();
+}
+
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 async function runCommand(command, args, options = {}) {
