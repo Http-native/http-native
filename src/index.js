@@ -19,6 +19,7 @@ import { createRuntimeOptimizer } from "../opt/runtime.js";
 const HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"];
 const ACTIVE_NATIVE_SERVERS = new Set();
 const EMPTY_BUFFER = Buffer.alloc(0);
+const NOOP_NEXT = () => undefined;
 const ERROR_REQUEST_PLAN = Object.freeze({
   method: true,
   path: true,
@@ -83,10 +84,12 @@ function normalizeContentType(type) {
 
 
 const RESPONSE_POOL_MAX = 512;
-const responsePool = [];
+const responseStatePool = [];
+const responseObjectPool = [];
+const DEFAULT_JSON_SERIALIZER = createJsonSerializer("fallback");
 
 function acquireResponseState() {
-  const pooled = responsePool.pop();
+  const pooled = responseStatePool.pop();
   if (pooled) {
     pooled.status = 200;
     // Reset headers — use null-prototype object for security
@@ -112,99 +115,108 @@ function acquireResponseState() {
 }
 
 function releaseResponseState(state) {
-  if (responsePool.length < RESPONSE_POOL_MAX) {
-    responsePool.push(state);
+  if (responseStatePool.length < RESPONSE_POOL_MAX) {
+    responseStatePool.push(state);
   }
 }
 
-function createResponseEnvelope(jsonSerializer = createJsonSerializer("fallback")) {
-  const state = acquireResponseState();
+const RESPONSE_PROTO = {
+  get finished() {
+    return this._state.finished;
+  },
 
-  const response = {
-    locals: state.locals,
+  status(code) {
+    this._state.status = Number(code);
+    return this;
+  },
 
-    get finished() {
-      return state.finished;
-    },
+  set(name, value) {
+    // Security: validate header name/value for CRLF injection
+    const headerName = String(name).toLowerCase();
+    const headerValue = String(value);
+    if (
+      headerName.includes("\r") ||
+      headerName.includes("\n") ||
+      headerValue.includes("\r") ||
+      headerValue.includes("\n")
+    ) {
+      return this; // Silently reject — security
+    }
+    this._state.headers[headerName] = headerValue;
+    return this;
+  },
 
-    status(code) {
-      state.status = Number(code);
-      return response;
-    },
+  header(name, value) {
+    return this.set(name, value);
+  },
 
-    set(name, value) {
-      // Security: validate header name/value for CRLF injection
-      const headerName = String(name).toLowerCase();
-      const headerValue = String(value);
-      if (headerName.includes("\r") || headerName.includes("\n") ||
-          headerValue.includes("\r") || headerValue.includes("\n")) {
-        return response; // Silently reject — security
-      }
-      state.headers[headerName] = headerValue;
-      return response;
-    },
+  get(name) {
+    return this._state.headers[String(name).toLowerCase()];
+  },
 
-    header(name, value) {
-      return response.set(name, value);
-    },
+  type(value) {
+    return this.set("content-type", normalizeContentType(String(value)));
+  },
 
-    get(name) {
-      return state.headers[String(name).toLowerCase()];
-    },
+  json(data) {
+    const state = this._state;
+    if (state.finished) {
+      return this;
+    }
 
-    type(value) {
-      return response.set("content-type", normalizeContentType(String(value)));
-    },
+    if (!state.headers["content-type"]) {
+      state.headers["content-type"] = "application/json; charset=utf-8";
+    }
 
-    json(data) {
-      if (state.finished) {
-        return response;
-      }
+    state.body = this._jsonSerializer(data);
+    state.finished = true;
+    return this;
+  },
 
+  send(data) {
+    const state = this._state;
+    if (state.finished) {
+      return this;
+    }
+
+    if (Buffer.isBuffer(data) || data instanceof Uint8Array) {
       if (!state.headers["content-type"]) {
-        state.headers["content-type"] = "application/json; charset=utf-8";
+        state.headers["content-type"] = "application/octet-stream";
       }
-
-      state.body = jsonSerializer(data);
-      state.finished = true;
-      return response;
-    },
-
-    send(data) {
-      if (state.finished) {
-        return response;
-      }
-
-      if (Buffer.isBuffer(data) || data instanceof Uint8Array) {
-        if (!state.headers["content-type"]) {
-          state.headers["content-type"] = "application/octet-stream";
-        }
-        state.body = Buffer.isBuffer(data)
-          ? data
-          : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
-      } else if (typeof data === "string") {
-        if (!state.headers["content-type"]) {
-          state.headers["content-type"] = "text/plain; charset=utf-8";
-        }
-        state.body = Buffer.from(data, "utf8");
-      } else if (data === undefined || data === null) {
-        state.body = EMPTY_BUFFER;
-      } else {
-        return response.json(data);
-      }
-
-      state.finished = true;
-      return response;
-    },
-
-    sendStatus(code) {
-      response.status(code);
+      state.body = Buffer.isBuffer(data)
+        ? data
+        : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+    } else if (typeof data === "string") {
       if (!state.headers["content-type"]) {
         state.headers["content-type"] = "text/plain; charset=utf-8";
       }
-      return response.send(String(code));
-    },
-  };
+      state.body = Buffer.from(data, "utf8");
+    } else if (data === undefined || data === null) {
+      state.body = EMPTY_BUFFER;
+    } else {
+      return this.json(data);
+    }
+
+    state.finished = true;
+    return this;
+  },
+
+  sendStatus(code) {
+    this.status(code);
+    const state = this._state;
+    if (!state.headers["content-type"]) {
+      state.headers["content-type"] = "text/plain; charset=utf-8";
+    }
+    return this.send(String(code));
+  },
+};
+
+function createResponseEnvelope(jsonSerializer = DEFAULT_JSON_SERIALIZER) {
+  const state = acquireResponseState();
+  const response = responseObjectPool.pop() ?? Object.create(RESPONSE_PROTO);
+  response._state = state;
+  response._jsonSerializer = jsonSerializer;
+  response.locals = state.locals;
 
   return {
     response,
@@ -216,6 +228,12 @@ function createResponseEnvelope(jsonSerializer = createJsonSerializer("fallback"
       };
     },
     release() {
+      response.locals = null;
+      response._jsonSerializer = DEFAULT_JSON_SERIALIZER;
+      response._state = null;
+      if (responseObjectPool.length < RESPONSE_POOL_MAX) {
+        responseObjectPool.push(response);
+      }
       releaseResponseState(state);
     },
   };
@@ -229,19 +247,19 @@ function createResponseEnvelope(jsonSerializer = createJsonSerializer("fallback"
 function createMiddlewareRunner(middlewares) {
   if (middlewares.length === 0) {
     // Fast path: no middlewares — return a no-op
-    return async function noopMiddleware(_req, _res) {};
+    return function noopMiddleware(_req, _res) {};
   }
 
   if (middlewares.length === 1) {
     // Fast path: single middleware — avoid dispatch overhead
     const mw = middlewares[0];
     if (mw.handler.length >= 3) {
-      return async function runSingleMiddleware(req, res) {
-        await mw.handler(req, res, () => Promise.resolve());
+      return function runSingleMiddleware(req, res) {
+        return mw.handler(req, res, NOOP_NEXT);
       };
     }
-    return async function runSingleMiddleware(req, res) {
-      await mw.handler(req, res);
+    return function runSingleMiddleware(req, res) {
+      return mw.handler(req, res);
     };
   }
 
@@ -337,6 +355,14 @@ function serializeErrorResponse(error, fallbackStatus = 500) {
   return encodeResponseEnvelope(buildDefaultErrorSnapshot(error, fallbackStatus));
 }
 
+function isPromiseLike(value) {
+  return (
+    value !== null &&
+    (typeof value === "object" || typeof value === "function") &&
+    typeof value.then === "function"
+  );
+}
+
 // ─── Dispatcher ───────────────────────────────────────────────────────────────
 
 function createDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) {
@@ -347,7 +373,10 @@ function createDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) 
     try {
       if (!res.finished) {
         for (const errorHandler of errorHandlers) {
-          await errorHandler(error, req, res);
+          const result = errorHandler(error, req, res);
+          if (!res.finished && isPromiseLike(result)) {
+            await result;
+          }
           if (res.finished) {
             break;
           }
@@ -400,9 +429,17 @@ function createDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) 
     const { response: res, snapshot, release } = createResponseEnvelope(route.jsonSerializer);
 
     try {
-      await route.runMiddlewares(req, res);
+      const middlewareResult = route.runMiddlewares(req, res);
+      if (!res.finished && isPromiseLike(middlewareResult)) {
+        await middlewareResult;
+      }
       if (!res.finished) {
-        await route.compiledHandler(req, res);
+        const handlerResult = route.compiledHandler(req, res);
+        // Async handlers with no await often finish synchronously and only return
+        // an already-resolved Promise. Skip awaiting when response is already done.
+        if (!res.finished && isPromiseLike(handlerResult)) {
+          await handlerResult;
+        }
       }
     } catch (error) {
       return finalizeError(error, req, res, snapshot, release, 500);

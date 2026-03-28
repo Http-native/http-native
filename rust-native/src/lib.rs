@@ -1066,9 +1066,11 @@ fn build_dispatch_envelope(
         push_string_value(&mut frame, value)?;
     }
 
-    for (name, value) in header_entries {
-        if should_include_header(name, matched_route) {
-            push_string_pair(&mut frame, name, value)?;
+    if selected_header_count > 0 {
+        for (name, value) in header_entries {
+            if should_include_header(name, matched_route) {
+                push_string_pair(&mut frame, name, value)?;
+            }
         }
     }
 
