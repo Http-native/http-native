@@ -16,7 +16,12 @@ use std::cell::RefCell;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use url::form_urlencoded;
 
+use crate::analyzer::{
+    DynamicFastPathResponse, DynamicValueSourceKind, JsonTemplateKind, JsonValueTemplate,
+    TextSegment,
+};
 use crate::manifest::{HttpServerConfigInput, ManifestInput};
 use crate::router::{ExactStaticRoute, MatchedRoute, Router};
 
@@ -555,17 +560,20 @@ async fn handle_connection_inner(
         // Build dispatch envelope directly from borrowed parse data, avoiding
         // String/Vec allocations for method, target, path, and headers.
         if !has_body {
-            let dispatch_request =
-                build_dispatch_request_zero_copy(router, &parsed, &[])?;
+            let dispatch_decision = build_dispatch_decision_zero_copy(router, &parsed, &[])?;
             drop(parsed);
             drain_consumed_bytes(buffer, header_bytes);
 
-            match dispatch_request {
-                Some(request) => {
+            match dispatch_decision {
+                DispatchDecision::BridgeRequest(request) => {
                     write_dynamic_dispatch_response(stream, dispatcher, request, keep_alive)
                         .await?;
                 }
-                None => {
+                DispatchDecision::SpecializedResponse(response) => {
+                    let (write_result, _) = stream.write_all(response).await;
+                    write_result?;
+                }
+                DispatchDecision::NotFound => {
                     write_not_found_response(stream, keep_alive).await?;
                 }
             }
@@ -846,27 +854,33 @@ fn parse_hot_root_request(
 /// Zero-copy dispatch: builds the bridge envelope directly from borrowed parse data,
 /// avoiding all String/Vec allocations for method, target, path, and headers.
 /// Used for non-body requests (GET, DELETE without body, etc.).
-fn build_dispatch_request_zero_copy(
+enum DispatchDecision {
+    BridgeRequest(Buffer),
+    SpecializedResponse(Vec<u8>),
+    NotFound,
+}
+
+fn build_dispatch_decision_zero_copy(
     router: &Router,
     parsed: &ParsedRequest<'_>,
     body: &[u8],
-) -> Result<Option<Buffer>> {
+) -> Result<DispatchDecision> {
     let Some(method_code) = method_code_from_bytes(parsed.method) else {
-        return Ok(None);
+        return Ok(DispatchDecision::NotFound);
     };
 
     let path_str = match std::str::from_utf8(parsed.path) {
         Ok(s) => s,
-        Err(_) => return Ok(None),
+        Err(_) => return Ok(DispatchDecision::NotFound),
     };
     let url_str = match std::str::from_utf8(parsed.target) {
         Ok(s) => s,
-        Err(_) => return Ok(None),
+        Err(_) => return Ok(DispatchDecision::NotFound),
     };
 
     let normalized_path = normalize_runtime_path(path_str);
     if contains_path_traversal(&normalized_path) {
-        return Ok(None);
+        return Ok(DispatchDecision::NotFound);
     }
 
     let Some(matched_route) = router.match_route(method_code, normalized_path.as_ref()) else {
@@ -877,7 +891,13 @@ fn build_dispatch_request_zero_copy(
             &parsed.headers,
             body,
         )
-        .map(Some);
+        .map(DispatchDecision::BridgeRequest);
+    };
+
+    if let Some(response) =
+        build_dynamic_fast_path_response(&matched_route, url_str, &parsed.headers, parsed.keep_alive)?
+    {
+        return Ok(DispatchDecision::SpecializedResponse(response));
     };
 
     build_dispatch_envelope(
@@ -888,7 +908,7 @@ fn build_dispatch_request_zero_copy(
         &parsed.headers,
         body,
     )
-    .map(Some)
+    .map(DispatchDecision::BridgeRequest)
 }
 
 fn build_dispatch_request_owned(
@@ -1022,13 +1042,13 @@ fn build_dispatch_envelope(
     if matched_route.param_values.len() > u16::MAX as usize {
         return Err(anyhow!("too many params"));
     }
-    let selected_headers = select_header_entries(header_entries, matched_route);
-    if selected_headers.len() > u16::MAX as usize {
+    let selected_header_count = count_selected_headers(header_entries, matched_route);
+    if selected_header_count > u16::MAX as usize {
         return Err(anyhow!("too many headers"));
     }
 
     let mut frame = Vec::with_capacity(
-        20 + url_bytes.len() + path_bytes.len() + selected_headers.len() * 16 + body.len(),
+        20 + url_bytes.len() + path_bytes.len() + selected_header_count * 16 + body.len(),
     );
     frame.push(BRIDGE_VERSION);
     frame.push(method_code);
@@ -1037,7 +1057,7 @@ fn build_dispatch_envelope(
     push_u32(&mut frame, url_bytes.len() as u32);
     push_u16(&mut frame, path_bytes.len() as u16);
     push_u16(&mut frame, matched_route.param_values.len() as u16);
-    push_u16(&mut frame, selected_headers.len() as u16);
+    push_u16(&mut frame, selected_header_count as u16);
     push_u32(&mut frame, body.len() as u32); // NEW: body length
     frame.extend_from_slice(url_bytes);
     frame.extend_from_slice(path_bytes);
@@ -1046,8 +1066,10 @@ fn build_dispatch_envelope(
         push_string_value(&mut frame, value)?;
     }
 
-    for (name, value) in selected_headers {
-        push_string_pair(&mut frame, name, value)?;
+    for (name, value) in header_entries {
+        if should_include_header(name, matched_route) {
+            push_string_pair(&mut frame, name, value)?;
+        }
     }
 
     frame.extend_from_slice(body); // NEW: body bytes at end
@@ -1055,30 +1077,331 @@ fn build_dispatch_envelope(
     Ok(Buffer::from(frame))
 }
 
-fn select_header_entries<'a>(
-    header_entries: &[(&'a str, &'a str)],
+fn count_selected_headers(
+    header_entries: &[(&str, &str)],
     matched_route: &MatchedRoute<'_, '_>,
-) -> Vec<(&'a str, &'a str)> {
+) -> usize {
     if matched_route.full_headers {
-        return header_entries.to_vec();
+        return header_entries.len();
     }
 
     if matched_route.header_keys.is_empty() {
-        return Vec::new();
+        return 0;
     }
 
-    let mut selected = Vec::with_capacity(matched_route.header_keys.len());
-    for (name, value) in header_entries {
-        if matched_route
-            .header_keys
-            .iter()
-            .any(|target| target.as_ref().eq_ignore_ascii_case(name))
-        {
-            selected.push((*name, *value));
+    header_entries
+        .iter()
+        .filter(|(name, _)| should_include_header(name, matched_route))
+        .count()
+}
+
+fn should_include_header(name: &str, matched_route: &MatchedRoute<'_, '_>) -> bool {
+    if matched_route.full_headers {
+        return true;
+    }
+    matched_route
+        .header_keys
+        .iter()
+        .any(|target| target.as_ref().eq_ignore_ascii_case(name))
+}
+
+enum ResolvedDynamicValue {
+    Missing,
+    Single(String),
+    Multi(Vec<String>),
+}
+
+fn build_dynamic_fast_path_response(
+    matched_route: &MatchedRoute<'_, '_>,
+    url: &str,
+    headers: &[(&str, &str)],
+    keep_alive: bool,
+) -> Result<Option<Vec<u8>>> {
+    let Some(fast_path) = matched_route.fast_path else {
+        return Ok(None);
+    };
+
+    let mut query_cache: Option<Vec<(String, String)>> = None;
+    let body = match &fast_path.response {
+        DynamicFastPathResponse::Json(template) => {
+            render_dynamic_json_body(template, matched_route, url, headers, &mut query_cache)?
+        }
+        DynamicFastPathResponse::Text(template) => {
+            render_dynamic_text_body(template, matched_route, url, headers, &mut query_cache)
+        }
+    };
+
+    Ok(Some(build_response_bytes_fast(
+        fast_path.status,
+        fast_path.headers.as_ref(),
+        &body,
+        keep_alive,
+    )))
+}
+
+fn render_dynamic_json_body(
+    template: &crate::analyzer::JsonTemplate,
+    matched_route: &MatchedRoute<'_, '_>,
+    url: &str,
+    headers: &[(&str, &str)],
+    query_cache: &mut Option<Vec<(String, String)>>,
+) -> Result<Vec<u8>> {
+    match &template.kind {
+        JsonTemplateKind::Literal(bytes) => Ok(bytes.to_vec()),
+        JsonTemplateKind::Object(fields) => {
+            let mut output = Vec::with_capacity(fields.len() * 24 + 16);
+            output.push(b'{');
+            let mut wrote_field = false;
+
+            for field in fields.iter() {
+                match &field.value {
+                    JsonValueTemplate::Literal(value_bytes) => {
+                        if wrote_field {
+                            output.push(b',');
+                        }
+                        output.extend_from_slice(field.key_prefix.as_ref());
+                        output.extend_from_slice(value_bytes.as_ref());
+                        wrote_field = true;
+                    }
+                    JsonValueTemplate::Dynamic(source) => {
+                        let resolved =
+                            resolve_dynamic_value(source, matched_route, url, headers, query_cache);
+                        match resolved {
+                            ResolvedDynamicValue::Missing => {}
+                            ResolvedDynamicValue::Single(value) => {
+                                if wrote_field {
+                                    output.push(b',');
+                                }
+                                output.extend_from_slice(field.key_prefix.as_ref());
+                                append_json_string(&mut output, value.as_str());
+                                wrote_field = true;
+                            }
+                            ResolvedDynamicValue::Multi(values) => {
+                                if wrote_field {
+                                    output.push(b',');
+                                }
+                                output.extend_from_slice(field.key_prefix.as_ref());
+                                output.push(b'[');
+                                for (index, value) in values.iter().enumerate() {
+                                    if index > 0 {
+                                        output.push(b',');
+                                    }
+                                    append_json_string(&mut output, value.as_str());
+                                }
+                                output.push(b']');
+                                wrote_field = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            output.push(b'}');
+            Ok(output)
+        }
+    }
+}
+
+fn render_dynamic_text_body(
+    template: &crate::analyzer::TextTemplate,
+    matched_route: &MatchedRoute<'_, '_>,
+    url: &str,
+    headers: &[(&str, &str)],
+    query_cache: &mut Option<Vec<(String, String)>>,
+) -> Vec<u8> {
+    let mut output = String::new();
+    for segment in template.segments.iter() {
+        match segment {
+            TextSegment::Literal(value) => output.push_str(value.as_ref()),
+            TextSegment::Dynamic(source) => match resolve_dynamic_value(
+                source,
+                matched_route,
+                url,
+                headers,
+                query_cache,
+            ) {
+                ResolvedDynamicValue::Missing => output.push_str("undefined"),
+                ResolvedDynamicValue::Single(value) => output.push_str(value.as_str()),
+                ResolvedDynamicValue::Multi(values) => {
+                    for (index, value) in values.iter().enumerate() {
+                        if index > 0 {
+                            output.push(',');
+                        }
+                        output.push_str(value.as_str());
+                    }
+                }
+            },
         }
     }
 
-    selected
+    output.into_bytes()
+}
+
+fn resolve_dynamic_value(
+    source: &crate::analyzer::DynamicValueSource,
+    matched_route: &MatchedRoute<'_, '_>,
+    url: &str,
+    headers: &[(&str, &str)],
+    query_cache: &mut Option<Vec<(String, String)>>,
+) -> ResolvedDynamicValue {
+    match source.kind {
+        DynamicValueSourceKind::Param => {
+            if let Some(value) = lookup_param_value(matched_route, source.key.as_ref()) {
+                return ResolvedDynamicValue::Single(value.to_string());
+            }
+            ResolvedDynamicValue::Missing
+        }
+        DynamicValueSourceKind::Header => {
+            if let Some(value) = lookup_header_value(headers, source.key.as_ref()) {
+                return ResolvedDynamicValue::Single(value.to_string());
+            }
+            ResolvedDynamicValue::Missing
+        }
+        DynamicValueSourceKind::Query => {
+            let entries = query_entries(url, query_cache);
+            lookup_query_value(entries.as_slice(), source.key.as_ref())
+        }
+    }
+}
+
+fn lookup_param_value<'m, 'r, 'p>(
+    matched_route: &'m MatchedRoute<'r, 'p>,
+    key: &str,
+) -> Option<&'p str> {
+    for (index, name) in matched_route.param_names.iter().enumerate() {
+        if name.as_ref() == key {
+            return matched_route.param_values.get(index).copied();
+        }
+    }
+    None
+}
+
+fn lookup_header_value<'a>(headers: &[(&'a str, &'a str)], key: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find_map(|(name, value)| name.eq_ignore_ascii_case(key).then_some(*value))
+}
+
+fn query_entries<'a>(
+    url: &str,
+    cache: &'a mut Option<Vec<(String, String)>>,
+) -> &'a Vec<(String, String)> {
+    if cache.is_none() {
+        let parsed = if let Some(query_start) = url.find('?') {
+            let query = &url[query_start + 1..];
+            form_urlencoded::parse(query.as_bytes())
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        *cache = Some(parsed);
+    }
+
+    cache.as_ref().expect("query cache must be initialized")
+}
+
+fn lookup_query_value(entries: &[(String, String)], key: &str) -> ResolvedDynamicValue {
+    let mut values: Vec<String> = Vec::new();
+    for (entry_key, entry_value) in entries.iter() {
+        if entry_key == key {
+            values.push(entry_value.clone());
+        }
+    }
+
+    match values.len() {
+        0 => ResolvedDynamicValue::Missing,
+        1 => ResolvedDynamicValue::Single(values.pop().unwrap_or_default()),
+        _ => ResolvedDynamicValue::Multi(values),
+    }
+}
+
+fn append_json_string(output: &mut Vec<u8>, value: &str) {
+    output.push(b'"');
+    for ch in value.chars() {
+        match ch {
+            '"' => output.extend_from_slice(br#"\""#),
+            '\\' => output.extend_from_slice(br#"\\"#),
+            '\n' => output.extend_from_slice(br#"\n"#),
+            '\r' => output.extend_from_slice(br#"\r"#),
+            '\t' => output.extend_from_slice(br#"\t"#),
+            '\x08' => output.extend_from_slice(br#"\b"#),
+            '\x0C' => output.extend_from_slice(br#"\f"#),
+            other if other.is_control() => {
+                let escaped = format!("\\u{:04x}", other as u32);
+                output.extend_from_slice(escaped.as_bytes());
+            }
+            other => {
+                let mut buf = [0u8; 4];
+                output.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+    }
+    output.push(b'"');
+}
+
+fn build_response_bytes_fast(
+    status: u16,
+    headers: &[(Box<str>, Box<str>)],
+    body: &[u8],
+    keep_alive: bool,
+) -> Vec<u8> {
+    let reason = status_reason(status);
+    let connection = if keep_alive { "keep-alive" } else { "close" };
+    let body_len = body.len();
+
+    let mut total_size =
+        9 + 3 + 1 + reason.len() + 2 + 16 + count_digits(body_len) + 2 + 12 + connection.len() + 2;
+
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("connection") {
+            continue;
+        }
+        if name.contains('\r')
+            || name.contains('\n')
+            || value.contains('\r')
+            || value.contains('\n')
+        {
+            continue;
+        }
+        total_size += name.len() + 2 + value.len() + 2;
+    }
+
+    total_size += 2 + body_len;
+
+    let mut output = Vec::with_capacity(total_size);
+    output.extend_from_slice(b"HTTP/1.1 ");
+    write_u16(&mut output, status);
+    output.push(b' ');
+    output.extend_from_slice(reason.as_bytes());
+    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(b"content-length: ");
+    write_usize(&mut output, body_len);
+    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(b"connection: ");
+    output.extend_from_slice(connection.as_bytes());
+    output.extend_from_slice(b"\r\n");
+
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("connection") {
+            continue;
+        }
+        if name.contains('\r')
+            || name.contains('\n')
+            || value.contains('\r')
+            || value.contains('\n')
+        {
+            continue;
+        }
+        output.extend_from_slice(name.as_bytes());
+        output.extend_from_slice(b": ");
+        output.extend_from_slice(value.as_bytes());
+        output.extend_from_slice(b"\r\n");
+    }
+
+    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(body);
+    output
 }
 
 // ─── Response Writing ─────────────────────────────────────────────────────────

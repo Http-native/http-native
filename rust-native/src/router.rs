@@ -3,9 +3,10 @@ use bytes::Bytes;
 use std::collections::HashMap;
 
 use crate::analyzer::{
-    analyze_route, normalize_path, parse_segments, AnalysisResult, RouteSegment,
+    analyze_dynamic_fast_path, analyze_route, normalize_path, parse_segments, AnalysisResult,
+    DynamicFastPathSpec, RouteSegment,
 };
-use crate::manifest::{ManifestInput, RouteInput};
+use crate::manifest::{ManifestInput, MiddlewareInput, RouteInput};
 
 const ROUTE_KIND_EXACT: u8 = 1;
 const ROUTE_KIND_PARAM: u8 = 2;
@@ -33,8 +34,10 @@ pub struct ExactStaticRoute {
 pub struct MatchedRoute<'a, 'b> {
     pub handler_id: u32,
     pub param_values: Vec<&'b str>,
+    pub param_names: &'a [Box<str>],
     pub header_keys: &'a [Box<str>],
     pub full_headers: bool,
+    pub fast_path: Option<&'a DynamicFastPathSpec>,
 }
 
 // ─── Internal Types ───────────────────────────────────────────────────────────
@@ -42,10 +45,10 @@ pub struct MatchedRoute<'a, 'b> {
 #[derive(Clone)]
 struct DynamicRouteSpec {
     handler_id: u32,
-    #[allow(dead_code)]
     param_names: Box<[Box<str>]>,
     header_keys: Box<[Box<str>]>,
     full_headers: bool,
+    fast_path: Option<DynamicFastPathSpec>,
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -226,13 +229,13 @@ impl Router {
                         .or_insert_with(HashMap::new)
                         .insert(
                             Box::<[u8]>::from(path.as_bytes()),
-                            compile_dynamic_route_spec(route),
+                            compile_dynamic_route_spec(route, &manifest.middlewares),
                         );
                 }
                 ROUTE_KIND_PARAM => {
                     // Insert into radix tree instead of linear Vec
                     let segments = parse_segments(path.as_str());
-                    let spec = compile_dynamic_route_spec(route);
+                    let spec = compile_dynamic_route_spec(route, &manifest.middlewares);
                     radix_trees
                         .entry(method_key)
                         .or_insert_with(RadixNode::new)
@@ -266,8 +269,10 @@ impl Router {
             return Some(MatchedRoute {
                 handler_id: route_spec.handler_id,
                 param_values: Vec::new(),
+                param_names: route_spec.param_names.as_ref(),
                 header_keys: route_spec.header_keys.as_ref(),
                 full_headers: route_spec.full_headers,
+                fast_path: route_spec.fast_path.as_ref(),
             });
         }
 
@@ -286,8 +291,10 @@ impl Router {
         Some(MatchedRoute {
             handler_id: spec.handler_id,
             param_values,
+            param_names: spec.param_names.as_ref(),
             header_keys: spec.header_keys.as_ref(),
             full_headers: spec.full_headers,
+            fast_path: spec.fast_path.as_ref(),
         })
     }
 
@@ -352,7 +359,7 @@ impl MethodKey {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-fn compile_dynamic_route_spec(route: &RouteInput) -> DynamicRouteSpec {
+fn compile_dynamic_route_spec(route: &RouteInput, middlewares: &[MiddlewareInput]) -> DynamicRouteSpec {
     let param_names = route
         .param_names
         .iter()
@@ -371,6 +378,7 @@ fn compile_dynamic_route_spec(route: &RouteInput) -> DynamicRouteSpec {
         param_names,
         header_keys,
         full_headers: route.full_headers,
+        fast_path: analyze_dynamic_fast_path(route, middlewares),
     }
 }
 
