@@ -37,6 +37,9 @@ pub struct MatchedRoute<'a, 'b> {
     pub param_names: &'a [Box<str>],
     pub header_keys: &'a [Box<str>],
     pub full_headers: bool,
+    pub needs_path: bool,
+    pub needs_url: bool,
+    pub needs_query: bool,
     pub fast_path: Option<&'a DynamicFastPathSpec>,
 }
 
@@ -48,6 +51,9 @@ struct DynamicRouteSpec {
     param_names: Box<[Box<str>]>,
     header_keys: Box<[Box<str>]>,
     full_headers: bool,
+    needs_path: bool,
+    needs_url: bool,
+    needs_query: bool,
     fast_path: Option<DynamicFastPathSpec>,
 }
 
@@ -272,6 +278,9 @@ impl Router {
                 param_names: route_spec.param_names.as_ref(),
                 header_keys: route_spec.header_keys.as_ref(),
                 full_headers: route_spec.full_headers,
+                needs_path: route_spec.needs_path,
+                needs_url: route_spec.needs_url,
+                needs_query: route_spec.needs_query,
                 fast_path: route_spec.fast_path.as_ref(),
             });
         }
@@ -294,6 +303,9 @@ impl Router {
             param_names: spec.param_names.as_ref(),
             header_keys: spec.header_keys.as_ref(),
             full_headers: spec.full_headers,
+            needs_path: spec.needs_path,
+            needs_url: spec.needs_url,
+            needs_query: spec.needs_query,
             fast_path: spec.fast_path.as_ref(),
         })
     }
@@ -378,6 +390,9 @@ fn compile_dynamic_route_spec(route: &RouteInput, middlewares: &[MiddlewareInput
         param_names,
         header_keys,
         full_headers: route.full_headers,
+        needs_path: route.needs_path,
+        needs_url: route.needs_url,
+        needs_query: route.needs_query,
         fast_path: analyze_dynamic_fast_path(route, middlewares),
     }
 }
@@ -460,6 +475,8 @@ fn build_response_bytes(
     response.extend_from_slice(body);
     response
 }
+
+// Todo: Are these expensive? if so remove them.
 
 fn status_reason(status: u16) -> &'static str {
     match status {

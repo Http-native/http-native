@@ -590,13 +590,19 @@ function fnv1aBytes(seed, bytes) {
   return hash >>> 0;
 }
 
-function compileRouteDispatch(route, middlewares, optConfig = {}) {
+function compileRouteDispatch(
+  route,
+  middlewares,
+  errorHandlerPlans = [],
+  optConfig = {},
+) {
   const applicableMiddlewares = middlewares.filter((middleware) =>
     pathPrefixMatches(middleware.pathPrefix, route.path),
   );
   const requestPlan = mergeRequestAccessPlans([
     route.accessPlan,
     ...applicableMiddlewares.map((middleware) => middleware.accessPlan),
+    ...errorHandlerPlans,
   ]);
 
   const requestFactory = createRequestFactory(
@@ -707,6 +713,9 @@ export function createApp() {
     async listen(options = {}) {
       const normalizedOptions = normalizeListenOptions(options);
       const compiledMiddlewares = this._middlewares.map(compileMiddlewareRegistration);
+      const errorHandlerPlans = this._errorHandlers.map((handler) =>
+        analyzeRequestAccess(Function.prototype.toString.call(handler)),
+      );
 
       const routes = this._routes.map((route) => {
         const handlerSource = Function.prototype.toString.call(route.handler);
@@ -720,7 +729,12 @@ export function createApp() {
         };
       });
       const compiledRoutes = routes.map((route) =>
-        compileRouteDispatch(route, compiledMiddlewares, normalizedOptions.opt),
+        compileRouteDispatch(
+          route,
+          compiledMiddlewares,
+          errorHandlerPlans,
+          normalizedOptions.opt,
+        ),
       );
 
       const manifest = {
@@ -740,6 +754,11 @@ export function createApp() {
           segmentCount: route.segmentCount,
           headerKeys: [...route.requestPlan.headerKeys],
           fullHeaders: route.requestPlan.fullHeaders,
+          needsPath: route.requestPlan.path,
+          needsUrl: route.requestPlan.url,
+          needsQuery:
+            route.requestPlan.fullQuery ||
+            route.requestPlan.queryKeys.size > 0,
         })),
       };
 

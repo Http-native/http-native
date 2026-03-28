@@ -1023,10 +1023,12 @@ fn build_dispatch_envelope(
     header_entries: &[(&str, &str)],
     body: &[u8],
 ) -> Result<Buffer> {
-    let url_bytes = url.as_bytes();
-    let path_bytes = path.as_bytes();
+    let include_url = matched_route.needs_url || matched_route.needs_query;
+    let include_path = matched_route.needs_path;
+    let url_bytes = if include_url { url.as_bytes() } else { b"" };
+    let path_bytes = if include_path { path.as_bytes() } else { b"" };
     let mut flags: u16 = 0;
-    if url.contains('?') {
+    if matched_route.needs_query && url.contains('?') {
         flags |= REQUEST_FLAG_QUERY_PRESENT;
     }
     if !body.is_empty() {
