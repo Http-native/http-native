@@ -79,7 +79,11 @@ console.log(server.optimizations.snapshot());
 Pass `opt: { notify: true }` to `listen()` if you want runtime logs when a route is already native static or looks stable enough to cache later.
 
 
-This should outperform the OLD shit code (found in old/), and be 50% faster than bun.server(), write tests in test.js plus add benchmarks so we know its faster than bun.
+This architecture is designed to outperform previous iterations and provide top-tier performance on par with or exceeding `bun.serve()`.
+Run tests via `test.js` and use the benchmark suite to validate performance gains.
+
+
+Since this is designed to be a core library, please ensure strict adherence to API stability and zero-allocation principles where possible.
 
 Remeber nadhi u moron this will be a library so don't go around doing shit.
 

@@ -48,4 +48,21 @@ pub struct RouteInput {
     pub needs_url: bool,
     #[serde(default)]
     pub needs_query: bool,
+    #[serde(default)]
+    pub cache: Option<CacheConfigInput>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheConfigInput {
+    pub ttl_secs: u64,
+    pub max_entries: usize,
+    pub vary_by: Vec<CacheVaryInput>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheVaryInput {
+    pub source: String,
+    pub name: String,
 }

@@ -63,6 +63,14 @@ const DANGEROUS_KEYS = new Set([
 
 // ─── Route Compilation ──────────────────
 
+/**
+ * Compile a route method + path pair into an efficient shape descriptor
+ * used by the Rust router for O(1) exact or O(M) radix-tree matching.
+ *
+ * @param {string} method - HTTP method (GET, POST, etc.)
+ * @param {string} path   - Route path, e.g. "/users/:id"
+ * @returns {{ methodCode: number, routeKind: number, paramNames: string[], segmentCount: number }}
+ */
 export function compileRouteShape(method, path) {
   const methodCode = METHOD_CODES[method];
   if (!methodCode) {
@@ -94,6 +102,15 @@ export function compileRouteShape(method, path) {
 
 // ─── Request Access Analysis ────────────
 
+/**
+ * Static-analyze a handler/middleware source string to determine which
+ * parts of the request object it actually reads (params, query, headers,
+ * method, path, url). The result drives zero-copy optimizations: fields
+ * that are never accessed are never materialized.
+ *
+ * @param {string} source - Function.prototype.toString() output
+ * @returns {Object} Frozen access plan describing required request fields
+ */
 export function analyzeRequestAccess(source) {
   const plan = createEmptyAccessPlan();
   const normalizedSource = String(source ?? "");
@@ -154,6 +171,14 @@ export function analyzeRequestAccess(source) {
   return freezeAccessPlan(plan);
 }
 
+/**
+ * Merge multiple access plans (route + middlewares + error handlers)
+ * into a single superset plan. The merged plan is the union of all
+ * required fields — if any plan needs a field, the merged plan needs it.
+ *
+ * @param {Object[]} plans - Array of frozen access plans
+ * @returns {Object} Frozen merged access plan
+ */
 export function mergeRequestAccessPlans(plans) {
   const merged = createEmptyAccessPlan();
 
@@ -194,11 +219,16 @@ function acquireRequestObject() {
   return requestPool.pop() || null;
 }
 
+/**
+ * Return a request object to the pool for reuse, resetting all internal
+ * state including any properties added by validation middleware.
+ *
+ * @param {Object} req - The request object to release
+ */
 export function releaseRequestObject(req) {
   if (requestPool.length >= REQUEST_POOL_MAX) {
     return;
   }
-  // Reset all fields before pooling
   req.method = "";
   req._path = undefined;
   req._url = undefined;
@@ -210,6 +240,9 @@ export function releaseRequestObject(req) {
   req._routeParamNames = null;
   req._plan = null;
   req._routeMethod = null;
+  req.validatedBody = undefined;
+  req.validatedQuery = undefined;
+  req.validatedParams = undefined;
   requestPool.push(req);
 }
 
@@ -328,6 +361,7 @@ function createPooledRequest() {
     },
   });
 
+  /** @returns {*|null} Parsed JSON body, or null if empty/missing */
   req.json = function json() {
     if (req._bodyParsed !== undefined) {
       return req._bodyParsed;
@@ -337,7 +371,13 @@ function createPooledRequest() {
       return null;
     }
     const text = textDecoder.decode(req._decoded.bodyBytes);
-    req._bodyParsed = JSON.parse(text);
+    try {
+      req._bodyParsed = JSON.parse(text);
+    } catch (parseError) {
+      throw new SyntaxError(
+        `Invalid JSON in request body: ${parseError.message}`,
+      );
+    }
     return req._bodyParsed;
   };
 
@@ -382,6 +422,16 @@ function methodNameFromCode(methodCode) {
   }
 }
 
+/**
+ * Build a factory function that stamps out request objects pre-configured
+ * for a specific route's access plan. The factory pulls from the object
+ * pool to avoid per-request allocations.
+ *
+ * @param {Object}   plan           - Frozen access plan for the target route
+ * @param {string[]} routeParamNames - Ordered parameter names from the route path
+ * @param {string}   routeMethod     - HTTP method string ("GET", "POST", etc.)
+ * @returns {Function} (decoded: Object) => request object
+ */
 export function createRequestFactory(
   plan,
   routeParamNames = EMPTY_ARRAY,
@@ -413,9 +463,15 @@ export function createRequestFactory(
 
 // ─── JSON Serialization ─────────────────
 
+/**
+ * Create a JSON serializer that converts a value to a UTF-8 Buffer.
+ * V8's native JSON.stringify is heavily optimized and almost always
+ * faster than any JS-level reimplementation, so we use it directly.
+ *
+ * @param {string} [mode="fallback"] - Serialization mode hint ("fallback"|"generic"|"specialized")
+ * @returns {Function & { kind: string }} Serializer: (value) => Buffer
+ */
 export function createJsonSerializer(mode = "fallback") {
-  // Performance: V8's native JSON.stringify is heavily optimized and almost always
-  // faster than any JS-level reimplementation. Use it directly.
   const serializer = (value) => {
     const serialized = JSON.stringify(value);
     return Buffer.from(serialized, "utf8");
@@ -426,6 +482,16 @@ export function createJsonSerializer(mode = "fallback") {
 
 // ─── Binary Protocol Codec ──────────────
 
+/**
+ * Decode a binary request envelope produced by the Rust native layer.
+ * Layout (little-endian): version(1) | methodCode(1) | flags(2) |
+ * handlerId(4) | urlLen(4) | pathLen(2) | paramCount(2) |
+ * headerCount(2) | bodyLen(4) | url | path | params… | headers… | body
+ *
+ * @param {Buffer|Uint8Array} buffer - Raw envelope bytes from Rust
+ * @returns {Object} Decoded envelope with handlerId, flags, methodCode, etc.
+ * @throws {Error} If the envelope version is unsupported or data is truncated
+ */
 export function decodeRequestEnvelope(buffer) {
   const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
   let offset = 0;
@@ -526,6 +592,14 @@ function getCachedHeaderNameBytes(name) {
   return bytes;
 }
 
+/**
+ * Encode a JS response snapshot into the binary envelope that the Rust
+ * layer can decode directly into HTTP/1.1 response bytes.
+ * Layout: status(2) | headerCount(2) | bodyLen(4) | headers… | body
+ *
+ * @param {{ status: number, headers: Object, body: Buffer }} snapshot
+ * @returns {Buffer} Binary-encoded response envelope
+ */
 export function encodeResponseEnvelope(snapshot) {
   const rawHeaders = snapshot.headers;
   const body = Buffer.isBuffer(snapshot.body)
@@ -651,16 +725,38 @@ function materializeSelectedHeadersFromLookup(headerLookup, selectedKeys) {
   return result;
 }
 
+/**
+ * Parse an HTTP query string into an object, avoiding URLSearchParams
+ * overhead. Automatically handles array values for duplicate keys.
+ *
+ * @param {string} url - The full requested URL
+ * @returns {Object} Null-prototype dictionary of parsed bounds
+ */
 function parseQuery(url) {
   const queryStart = url.indexOf("?");
   if (queryStart < 0 || queryStart === url.length - 1) {
     return Object.create(null);
   }
 
-  const params = new URLSearchParams(url.slice(queryStart + 1));
   const result = Object.create(null);
+  const queryStr = url.slice(queryStart + 1);
+  const pairs = queryStr.split("&");
 
-  for (const [key, value] of params) {
+  for (let i = 0; i < pairs.length; i++) {
+    const pair = pairs[i];
+    if (!pair) continue;
+
+    const eqIndex = pair.indexOf("=");
+    let key, value;
+
+    if (eqIndex < 0) {
+      key = decodeUriComponentFast(pair);
+      value = "";
+    } else {
+      key = decodeUriComponentFast(pair.slice(0, eqIndex));
+      value = decodeUriComponentFast(pair.slice(eqIndex + 1));
+    }
+
     if (DANGEROUS_KEYS.has(key)) {
       continue;
     }
@@ -670,6 +766,13 @@ function parseQuery(url) {
   return result;
 }
 
+/**
+ * Same as parseQuery, but only yields keys in the selectedKeys set.
+ *
+ * @param {string} url
+ * @param {Set<string>} selectedKeys
+ * @returns {Object}
+ */
 function parseSelectedQuery(url, selectedKeys) {
   if (selectedKeys.size === 0) {
     return Object.create(null);
@@ -680,16 +783,47 @@ function parseSelectedQuery(url, selectedKeys) {
     return Object.create(null);
   }
 
-  const params = new URLSearchParams(url.slice(queryStart + 1));
   const result = Object.create(null);
+  const queryStr = url.slice(queryStart + 1);
+  const pairs = queryStr.split("&");
 
-  for (const [key, value] of params) {
+  for (let i = 0; i < pairs.length; i++) {
+    const pair = pairs[i];
+    if (!pair) continue;
+
+    const eqIndex = pair.indexOf("=");
+    let key, value;
+
+    if (eqIndex < 0) {
+      key = decodeUriComponentFast(pair);
+      value = "";
+    } else {
+      key = decodeUriComponentFast(pair.slice(0, eqIndex));
+      value = decodeUriComponentFast(pair.slice(eqIndex + 1));
+    }
+
     if (selectedKeys.has(key) && !DANGEROUS_KEYS.has(key)) {
       pushQueryEntry(result, key, value);
     }
   }
 
   return result;
+}
+
+/**
+ * Fast decoding helper replacing all '+' with ' ' before decoding.
+ * Fallback to raw value if decodeURIComponent throws.
+ *
+ * @param {string} str
+ * @returns {string}
+ */
+function decodeUriComponentFast(str) {
+  const normalized = str.replace(/\+/g, " ");
+  try {
+    return decodeURIComponent(normalized);
+  } catch (e) {
+    return normalized;
+  }
 }
 
 function pushQueryEntry(result, key, value) {
@@ -813,9 +947,7 @@ function identity(value) {
   return value;
 }
 
-function encodeUtf8(value) {
-  return textEncoder.encode(String(value));
-}
+
 
 // ─── Binary Protocol Helpers ────────────
 

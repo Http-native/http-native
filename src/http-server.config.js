@@ -1,3 +1,16 @@
+/**
+ * @typedef {Object} HttpServerConfig
+ * @property {string}  defaultHost                   - Bind address (default "127.0.0.1")
+ * @property {number}  defaultBacklog                - TCP listen backlog (default 2048)
+ * @property {number}  maxHeaderBytes                - Maximum header block size in bytes
+ * @property {string}  hotGetRootHttp11              - Hot-path prefix for GET / HTTP/1.1
+ * @property {string}  hotGetRootHttp10              - Hot-path prefix for GET / HTTP/1.0
+ * @property {string}  headerConnectionPrefix        - Lowercase "connection:" for matching
+ * @property {string}  headerContentLengthPrefix     - Lowercase "content-length:" for matching
+ * @property {string}  headerTransferEncodingPrefix  - Lowercase "transfer-encoding:" for matching
+ */
+
+/** @type {HttpServerConfig} */
 const httpServerConfig = {
   defaultHost: "127.0.0.1",
   defaultBacklog: 2048,
@@ -9,6 +22,13 @@ const httpServerConfig = {
   headerTransferEncodingPrefix: "transfer-encoding:",
 };
 
+/**
+ * Merge caller-provided overrides with built-in defaults, coercing
+ * every field to the expected primitive type.
+ *
+ * @param {Partial<HttpServerConfig>} [overrides={}]
+ * @returns {HttpServerConfig} Fully-populated, type-coerced config
+ */
 export function normalizeHttpServerConfig(overrides = {}) {
   return {
     defaultHost: String(overrides.defaultHost ?? httpServerConfig.defaultHost),

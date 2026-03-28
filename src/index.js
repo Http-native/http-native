@@ -37,6 +37,13 @@ const ERROR_REQUEST_PLAN = Object.freeze({
 
 // ─── Path Normalization ─────────────────
 
+/**
+ * Normalize a middleware path prefix: strip trailing slashes,
+ * ensure leading slash. Root "/" is returned as-is.
+ *
+ * @param {string} path
+ * @returns {string}
+ */
 function normalizePathPrefix(path) {
   if (path === "/") {
     return "/";
@@ -46,6 +53,15 @@ function normalizePathPrefix(path) {
   return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
 }
 
+/**
+ * Validate and normalize a route path. Throws if the path
+ * does not start with "/".
+ *
+ * @param {string} method - HTTP method (for error messages)
+ * @param {string} path
+ * @returns {string} Normalized path
+ * @throws {TypeError}
+ */
 function normalizeRoutePath(method, path) {
   if (typeof path !== "string" || !path.startsWith("/")) {
     throw new TypeError(`Route path for ${method} must start with "/"`);
@@ -54,6 +70,14 @@ function normalizeRoutePath(method, path) {
   return normalizePathPrefix(path);
 }
 
+/**
+ * Check whether a request path falls under the given prefix.
+ * Root prefix "/" matches everything.
+ *
+ * @param {string} pathPrefix
+ * @param {string} requestPath
+ * @returns {boolean}
+ */
 function pathPrefixMatches(pathPrefix, requestPath) {
   if (pathPrefix === "/") {
     return true;
@@ -89,20 +113,21 @@ const responseStatePool = [];
 const responseObjectPool = [];
 const DEFAULT_JSON_SERIALIZER = createJsonSerializer("fallback");
 
+/**
+ * Acquire a response-state object from the pool, or allocate a fresh one.
+ * Uses Object.create(null) replacement instead of key-by-key deletion
+ * for faster V8 hidden-class transitions.
+ *
+ * @returns {{ status: number, headers: Object, body: Buffer, finished: boolean, locals: Object }}
+ */
 function acquireResponseState() {
   const pooled = responseStatePool.pop();
   if (pooled) {
     pooled.status = 200;
-    // Reset headers — use null-prototype object for security
-    for (const key in pooled.headers) {
-      delete pooled.headers[key];
-    }
+    pooled.headers = Object.create(null);
     pooled.body = EMPTY_BUFFER;
     pooled.finished = false;
-    // Reset locals
-    for (const key in pooled.locals) {
-      delete pooled.locals[key];
-    }
+    pooled.locals = Object.create(null);
     return pooled;
   }
 
@@ -131,8 +156,15 @@ const RESPONSE_PROTO = {
     return this;
   },
 
+  /**
+   * Set a response header. CRLF sequences in name or value are
+   * rejected to prevent HTTP response splitting attacks.
+   *
+   * @param {string} name
+   * @param {string} value
+   * @returns {this}
+   */
   set(name, value) {
-    // Security: validate header name/value for CRLF injection
     const headerName = String(name).toLowerCase();
     const headerValue = String(value);
     if (
@@ -141,7 +173,12 @@ const RESPONSE_PROTO = {
       headerValue.includes("\r") ||
       headerValue.includes("\n")
     ) {
-      return this; // Silently reject — security
+      if (process.env.NODE_ENV !== "production") {
+        console.warn(
+          `[http-native] CRLF injection blocked in response header: ${JSON.stringify(name)}`,
+        );
+      }
+      return this;
     }
     this._state.headers[headerName] = headerValue;
     return this;
@@ -469,7 +506,22 @@ function createDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) 
 
 // ─── Route Registration & Compilation ───
 
-function normalizeRouteRegistration(method, path, handler) {
+/**
+ * Normalize and validate a route registration, optionally accepting
+ * route-level options (e.g. cache configuration).
+ *
+ * @param {string}   method
+ * @param {string}   path
+ * @param {Function} handler
+ * @param {Object}   [options={}]
+ * @param {Object}   [options.cache]            - Native cache configuration
+ * @param {number}   [options.cache.ttl]        - Cache TTL in seconds
+ * @param {string[]} [options.cache.varyBy]     - Fields to vary cache key by
+ * @param {number}   [options.cache.maxEntries] - Max LRU entries (default 256)
+ * @returns {Object} Normalized route descriptor
+ * @throws {TypeError}
+ */
+function normalizeRouteRegistration(method, path, handler, options = {}) {
   if (typeof handler !== "function") {
     throw new TypeError(`Handler for ${method} ${path} must be a function`);
   }
@@ -478,6 +530,7 @@ function normalizeRouteRegistration(method, path, handler) {
     method,
     path: normalizeRoutePath(method, path),
     handler,
+    cache: options.cache || null,
   };
 }
 
@@ -637,16 +690,37 @@ function compileRouteDispatch(
   };
 }
 
+/**
+ * Create a chainable method registrar for a given HTTP method.
+ * Supports both (path, handler) and (path, options, handler) signatures
+ * to enable per-route cache configuration.
+ *
+ * @param {Object} app    - The application instance
+ * @param {string} method - HTTP method name or "ALL"
+ * @returns {Function} (path, [options], handler) => app
+ */
 function createMethodRegistrar(app, method) {
-  return (path, handler) => {
+  return (path, optionsOrHandler, maybeHandler) => {
+    let options = {};
+    let handler;
+
+    if (typeof optionsOrHandler === "function") {
+      handler = optionsOrHandler;
+    } else {
+      options = optionsOrHandler || {};
+      handler = maybeHandler;
+    }
+
     if (method === "ALL") {
       for (const concreteMethod of HTTP_METHODS) {
-        app._routes.push(normalizeRouteRegistration(concreteMethod, path, handler));
+        app._routes.push(
+          normalizeRouteRegistration(concreteMethod, path, handler, options),
+        );
       }
       return app;
     }
 
-    app._routes.push(normalizeRouteRegistration(method, path, handler));
+    app._routes.push(normalizeRouteRegistration(method, path, handler, options));
     return app;
   };
 }
@@ -670,6 +744,12 @@ function normalizeListenOptions(options = {}) {
 
 // ─── Application Factory ───────────────
 
+/**
+ * Create a new http-native application instance with Express-like
+ * route registration, middleware support, and error handling.
+ *
+ * @returns {import('./index').Application}
+ */
 export function createApp() {
   const native = loadNativeModule();
   let nextHandlerId = 1;
@@ -727,11 +807,11 @@ export function createApp() {
         const handlerSource = Function.prototype.toString.call(route.handler);
 
         return {
-        ...route,
-        handlerId: nextHandlerId++,
-        handlerSource,
-        accessPlan: analyzeRequestAccess(handlerSource),
-        ...compileRouteShape(route.method, route.path),
+          ...route,
+          handlerId: nextHandlerId++,
+          handlerSource,
+          accessPlan: analyzeRequestAccess(handlerSource),
+          ...compileRouteShape(route.method, route.path),
         };
       });
       const compiledRoutes = routes.map((route) =>
@@ -765,6 +845,18 @@ export function createApp() {
           needsQuery:
             route.requestPlan.fullQuery ||
             route.requestPlan.queryKeys.size > 0,
+          cache: route.cache
+            ? {
+                ttlSecs: route.cache.ttl || 60,
+                maxEntries: route.cache.maxEntries || 256,
+                varyBy: (route.cache.varyBy || []).map((key) => {
+                  const dotIndex = key.indexOf(".");
+                  return dotIndex >= 0
+                    ? { source: key.slice(0, dotIndex), name: key.slice(dotIndex + 1) }
+                    : { source: "query", name: key };
+                }),
+              }
+            : null,
         })),
       };
 
