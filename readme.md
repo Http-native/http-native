@@ -85,3 +85,7 @@ Run tests via `test.js` and use the benchmark suite to validate performance gain
 
 Since this is designed to be a core library, please ensure strict adherence to API stability and zero-allocation principles where possible.
 
+Remeber nadhi u moron this will be a library so don't go around doing shit.
+
+
+bump action
