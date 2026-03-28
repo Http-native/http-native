@@ -1,6 +1,7 @@
 use anyhow::Result;
 use bytes::Bytes;
 use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::analyzer::{
     analyze_dynamic_fast_path, analyze_route, normalize_path, parse_segments, AnalysisResult,
@@ -41,6 +42,21 @@ pub struct MatchedRoute<'a, 'b> {
     pub needs_url: bool,
     pub needs_query: bool,
     pub fast_path: Option<&'a DynamicFastPathSpec>,
+    pub cache_config: Option<&'a RouteCacheConfig>,
+}
+
+#[derive(Clone)]
+pub struct RouteCacheConfig {
+    pub ttl_secs: u64,
+    pub max_entries: usize,
+    pub vary_keys: Box<[CacheVaryKey]>,
+}
+
+#[derive(Clone)]
+pub enum CacheVaryKey {
+    QueryParam(Box<str>),
+    PathParam(Box<str>),
+    Header(Box<str>),
 }
 
 // ─── Internal Types ─────────────────────
@@ -55,6 +71,7 @@ struct DynamicRouteSpec {
     needs_url: bool,
     needs_query: bool,
     fast_path: Option<DynamicFastPathSpec>,
+    cache_config: Option<RouteCacheConfig>,
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -282,6 +299,7 @@ impl Router {
                 needs_url: route_spec.needs_url,
                 needs_query: route_spec.needs_query,
                 fast_path: route_spec.fast_path.as_ref(),
+                cache_config: route_spec.cache_config.as_ref(),
             });
         }
 
@@ -307,6 +325,7 @@ impl Router {
             needs_url: spec.needs_url,
             needs_query: spec.needs_query,
             fast_path: spec.fast_path.as_ref(),
+            cache_config: spec.cache_config.as_ref(),
         })
     }
 
@@ -385,6 +404,21 @@ fn compile_dynamic_route_spec(route: &RouteInput, middlewares: &[MiddlewareInput
         .collect::<Vec<_>>()
         .into_boxed_slice();
 
+    let cache_config = route.cache.as_ref().map(|cache_in| {
+        let vary_keys = cache_in.vary_by.iter().map(|v| match v.source.as_str() {
+            "query" => CacheVaryKey::QueryParam(v.name.clone().into_boxed_str()),
+            "params" => CacheVaryKey::PathParam(v.name.clone().into_boxed_str()),
+            "headers" | "header" => CacheVaryKey::Header(v.name.clone().into_boxed_str()),
+            _ => CacheVaryKey::QueryParam(v.name.clone().into_boxed_str()),
+        }).collect::<Vec<_>>().into_boxed_slice();
+
+        RouteCacheConfig {
+            ttl_secs: cache_in.ttl_secs,
+            max_entries: cache_in.max_entries.max(1),
+            vary_keys,
+        }
+    });
+
     DynamicRouteSpec {
         handler_id: route.handler_id,
         param_names,
@@ -394,6 +428,7 @@ fn compile_dynamic_route_spec(route: &RouteInput, middlewares: &[MiddlewareInput
         needs_url: route.needs_url,
         needs_query: route.needs_query,
         fast_path: analyze_dynamic_fast_path(route, middlewares),
+        cache_config,
     }
 }
 
@@ -484,11 +519,276 @@ fn status_reason(status: u16) -> &'static str {
         201 => "Created",
         202 => "Accepted",
         204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
+        405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        409 => "Conflict",
+        411 => "Length Required",
+        413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
+        422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
+        431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
+        501 => "Not Implemented",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
-        _ => "OK",
+        504 => "Gateway Timeout",
+        _ => "Unknown",
     }
+}
+
+// ─── Native Zero-Allocation LRU Cache ───
+
+pub struct CacheEntry {
+    pub response_bytes: Bytes,
+    pub response_bytes_close: Bytes,
+    pub expires_at: Instant,
+}
+
+struct LruNode {
+    key: u64,
+    value: Option<CacheEntry>,
+    prev: usize,
+    next: usize,
+}
+
+pub struct RouteCache {
+    map: HashMap<u64, usize>,
+    nodes: Vec<LruNode>,
+    head: usize,
+    tail: usize,
+    max_entries: usize,
+    free_list: Vec<usize>,
+}
+
+const NULL_NODE: usize = usize::MAX;
+
+impl RouteCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            map: HashMap::with_capacity(max_entries),
+            nodes: Vec::with_capacity(max_entries),
+            head: NULL_NODE,
+            tail: NULL_NODE,
+            max_entries,
+            free_list: Vec::new(),
+        }
+    }
+
+    pub fn get(&mut self, key: u64, now: Instant) -> Option<&CacheEntry> {
+        if let Some(&idx) = self.map.get(&key) {
+            // Check expiry
+            if let Some(val) = &self.nodes[idx].value {
+                if now < val.expires_at {
+                    self.move_to_head(idx);
+                    return self.nodes[idx].value.as_ref();
+                }
+            }
+            // Expired -> remove
+            self.remove_node(idx);
+            self.map.remove(&key);
+        }
+        None
+    }
+
+    pub fn insert(&mut self, key: u64, entry: CacheEntry) {
+        if let Some(&idx) = self.map.get(&key) {
+            self.nodes[idx].value = Some(entry);
+            self.move_to_head(idx);
+            return;
+        }
+
+        let new_idx = if let Some(idx) = self.free_list.pop() {
+            idx
+        } else if self.nodes.len() < self.max_entries {
+            let idx = self.nodes.len();
+            self.nodes.push(LruNode {
+                key: 0,
+                value: None,
+                prev: NULL_NODE,
+                next: NULL_NODE,
+            });
+            idx
+        } else {
+            // Evict tail
+            let tail_idx = self.tail;
+            if tail_idx != NULL_NODE {
+                let tail_key = self.nodes[tail_idx].key;
+                self.remove_node(tail_idx);
+                self.map.remove(&tail_key);
+                tail_idx
+            } else {
+                return; // 0 entries
+            }
+        };
+
+        self.nodes[new_idx].key = key;
+        self.nodes[new_idx].value = Some(entry);
+        self.map.insert(key, new_idx);
+        self.push_head(new_idx);
+    }
+    
+    #[allow(dead_code)]
+    pub fn invalidate(&mut self, key: u64) {
+        if let Some(&idx) = self.map.get(&key) {
+            self.remove_node(idx);
+            self.map.remove(&key);
+        }
+    }
+
+    fn move_to_head(&mut self, idx: usize) {
+        if self.head == idx {
+            return;
+        }
+        self.remove_link(idx);
+        self.push_head(idx);
+    }
+
+    fn push_head(&mut self, idx: usize) {
+        self.nodes[idx].prev = NULL_NODE;
+        self.nodes[idx].next = self.head;
+        if self.head != NULL_NODE {
+            self.nodes[self.head].prev = idx;
+        }
+        self.head = idx;
+        if self.tail == NULL_NODE {
+            self.tail = idx;
+        }
+    }
+
+    fn remove_link(&mut self, idx: usize) {
+        let prev = self.nodes[idx].prev;
+        let next = self.nodes[idx].next;
+
+        if prev != NULL_NODE {
+            self.nodes[prev].next = next;
+        } else {
+            self.head = next;
+        }
+
+        if next != NULL_NODE {
+            self.nodes[next].prev = prev;
+        } else {
+            self.tail = prev;
+        }
+    }
+
+    fn remove_node(&mut self, idx: usize) {
+        self.remove_link(idx);
+        self.nodes[idx].value = None;
+        self.free_list.push(idx);
+    }
+}
+
+use std::cell::RefCell;
+
+thread_local! {
+    static ROUTE_CACHES: RefCell<HashMap<u32, RouteCache>> = RefCell::new(HashMap::new());
+}
+
+pub fn get_cached_response(handler_id: u32, key: u64, keep_alive: bool) -> Option<Bytes> {
+    ROUTE_CACHES.with(|caches| {
+        let mut caches = caches.borrow_mut();
+        if let Some(cache) = caches.get_mut(&handler_id) {
+            if let Some(entry) = cache.get(key, Instant::now()) {
+                return Some(if keep_alive {
+                    entry.response_bytes.clone()
+                } else {
+                    entry.response_bytes_close.clone()
+                });
+            }
+        }
+        None
+    })
+}
+
+pub fn insert_cached_response(handler_id: u32, key: u64, entry: CacheEntry, max_entries: usize) {
+    ROUTE_CACHES.with(|caches| {
+        let mut caches = caches.borrow_mut();
+        let cache = caches.entry(handler_id).or_insert_with(|| RouteCache::new(max_entries));
+        cache.insert(key, entry);
+    });
+}
+
+pub fn interpolate_cache_key(
+    config: &RouteCacheConfig,
+    parsed: &crate::ParsedRequest<'_>,
+    url: &str,
+    param_names: &[Box<str>],
+    param_values: &[&str],
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    use std::collections::hash_map::DefaultHasher;
+    
+    let mut hasher = DefaultHasher::new();
+    
+    for vary_key in config.vary_keys.iter() {
+        match vary_key {
+            CacheVaryKey::QueryParam(name) => {
+                let name_str = name.as_ref();
+                let mut found = false;
+                if let Some(query_idx) = url.find('?') {
+                    let query_str = &url[query_idx + 1..];
+                    for pair in query_str.split('&') {
+                        let mut kv = pair.splitn(2, '=');
+                        if let (Some(k), Some(v)) = (kv.next(), kv.next()) {
+                            if k == name_str {
+                                name_str.hash(&mut hasher);
+                                v.hash(&mut hasher);
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if !found {
+                    name_str.hash(&mut hasher);
+                    b"".hash(&mut hasher);
+                }
+            }
+            CacheVaryKey::PathParam(name) => {
+                let name_str = name.as_ref();
+                let mut found = false;
+                for (i, p_name) in param_names.iter().enumerate() {
+                    if p_name.as_ref() == name_str {
+                        if let Some(val) = param_values.get(i) {
+                            name_str.hash(&mut hasher);
+                            val.hash(&mut hasher);
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if !found {
+                    name_str.hash(&mut hasher);
+                    b"".hash(&mut hasher);
+                }
+            }
+            CacheVaryKey::Header(name) => {
+                let name_str = name.as_ref();
+                let mut found = false;
+                for (h_name, h_val) in parsed.headers.iter() {
+                    if h_name.eq_ignore_ascii_case(name_str) {
+                        name_str.hash(&mut hasher);
+                        h_val.hash(&mut hasher);
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    name_str.hash(&mut hasher);
+                    b"".hash(&mut hasher);
+                }
+            }
+        }
+    }
+    
+    hasher.finish()
 }

@@ -4,6 +4,18 @@ const HOT_HIT_THRESHOLD = 128;
 const STABLE_RESPONSE_THRESHOLD = 32;
 const DEFAULT_NOTIFY_INTERVAL_MS = 1000;
 
+/**
+ * Create a runtime optimizer that tracks per-route dispatch metrics,
+ * detects static-fast-path candidates, and identifies cache-promotable
+ * routes whose responses remain stable across many invocations.
+ *
+ * @param {Object[]} routes       - Compiled route descriptors from compileRouteDispatch
+ * @param {Object[]} middlewares  - Compiled middleware descriptors
+ * @param {Object}   [options={}] - Runtime optimization options
+ * @param {boolean}  [options.notify=false] - Emit optimization logs to stdout
+ * @param {number}   [options.notifyIntervalMs=1000] - Interval for periodic hit summaries
+ * @returns {{ recordDispatch: Function, snapshot: Function, summary: Function, dispose: Function }}
+ */
 export function createRuntimeOptimizer(routes, middlewares, options = {}) {
   const notifyEnabled =
     options.notify === true || process.env.HTTP_NATIVE_OPT_NOTIFY === "1";
@@ -38,6 +50,14 @@ export function createRuntimeOptimizer(routes, middlewares, options = {}) {
   }
 
   return {
+    /**
+     * Record a single dispatch event for the given route and check
+     * whether the route is eligible for promotion (hot, cache, etc.).
+     *
+     * @param {Object} route    - The compiled route descriptor
+     * @param {Object} _request - The request object (unused but reserved)
+     * @param {Object} snapshot - Response snapshot { status, headers, body }
+     */
     recordDispatch(route, _request, snapshot) {
       const entry = routesByHandlerId.get(route.handlerId);
       if (!entry || entry.settled) {
@@ -60,7 +80,6 @@ export function createRuntimeOptimizer(routes, middlewares, options = {}) {
               : `${entry.label} is hot on bridge dispatch`,
           );
 
-          // Non-cache candidates: no more recording needed
           if (!entry.cacheCandidate) {
             entry.settled = true;
           }
@@ -68,7 +87,6 @@ export function createRuntimeOptimizer(routes, middlewares, options = {}) {
         return;
       }
 
-      // Only cache candidates reach here in "hot" stage
       if (!entry.cacheCandidate) {
         entry.settled = true;
         return;
@@ -97,6 +115,11 @@ export function createRuntimeOptimizer(routes, middlewares, options = {}) {
       }
     },
 
+    /**
+     * Return a structured snapshot of every route's optimization state.
+     *
+     * @returns {{ generatedAt: string, routes: Object[] }}
+     */
     snapshot() {
       return {
         generatedAt: new Date().toISOString(),
@@ -119,6 +142,12 @@ export function createRuntimeOptimizer(routes, middlewares, options = {}) {
       };
     },
 
+    /**
+     * Return a human-readable multi-line summary string of all route
+     * optimization states, suitable for logging.
+     *
+     * @returns {string}
+     */
     summary() {
       return routeEntries
         .map((entry) => {
@@ -146,6 +175,7 @@ export function createRuntimeOptimizer(routes, middlewares, options = {}) {
         .join("\n");
     },
 
+    /** Stop the periodic notify timer and release resources. */
     dispose() {
       if (disposed) {
         return;
@@ -158,6 +188,14 @@ export function createRuntimeOptimizer(routes, middlewares, options = {}) {
   };
 }
 
+/**
+ * Build an internal tracking entry for a single route, pre-classifying
+ * it as static-fast-path, cache-candidate, or generic bridge-dispatch.
+ *
+ * @param {Object}   route       - Compiled route descriptor
+ * @param {Object[]} middlewares  - Compiled middleware descriptors
+ * @returns {Object} Route tracking entry
+ */
 function buildRouteEntry(route, middlewares) {
   const hasParams = route.path.includes(":");
   const hasMiddleware = middlewares.some((middleware) =>
@@ -212,6 +250,11 @@ function buildRouteEntry(route, middlewares) {
   };
 }
 
+/**
+ * Print the initial route catalog to stdout when notify mode is enabled.
+ *
+ * @param {Object[]} routeEntries
+ */
 function printRouteCatalog(routeEntries) {
   if (routeEntries.length === 0) {
     console.log("[http-native][opt] no routes registered");
@@ -226,6 +269,11 @@ function printRouteCatalog(routeEntries) {
   }
 }
 
+/**
+ * Print live hit counts for routes that have been dispatched at least once.
+ *
+ * @param {Object[]} routeEntries
+ */
 function printLiveRouteHits(routeEntries) {
   const active = routeEntries.filter((entry) => entry.hits > 0);
   if (active.length === 0) {
@@ -243,6 +291,11 @@ function printLiveRouteHits(routeEntries) {
   }
 }
 
+/**
+ * @param {*}      value
+ * @param {number} fallback
+ * @returns {number}
+ */
 function normalizeNotifyInterval(value, fallback) {
   const normalized = Number(value);
   if (!Number.isFinite(normalized) || normalized <= 0) {
@@ -251,6 +304,12 @@ function normalizeNotifyInterval(value, fallback) {
   return Math.floor(normalized);
 }
 
+/**
+ * @param {Object[]} routeEntries
+ * @param {number}   notifyIntervalMs
+ * @param {Function} onTick
+ * @returns {NodeJS.Timer}
+ */
 function startNotifyTimer(routeEntries, notifyIntervalMs, onTick) {
   const timer = setInterval(onTick, notifyIntervalMs);
   if (typeof timer.unref === "function") {
@@ -259,6 +318,16 @@ function startNotifyTimer(routeEntries, notifyIntervalMs, onTick) {
   return timer;
 }
 
+/**
+ * Determine whether a route qualifies for the static fast path:
+ * a GET route with no params, no middleware, no async, whose handler
+ * is a single res.json() or res.send() call with a literal payload.
+ *
+ * @param {Object}  route
+ * @param {boolean} hasMiddleware
+ * @param {string}  source - Handler source code
+ * @returns {boolean}
+ */
 function isStaticFastPathCandidate(route, hasMiddleware, source) {
   if (route.method !== "GET" || route.path.includes(":") || hasMiddleware) {
     return false;
@@ -281,6 +350,10 @@ function isStaticFastPathCandidate(route, hasMiddleware, source) {
   );
 }
 
+/**
+ * @param {string} source
+ * @returns {string}
+ */
 function extractFunctionBody(source) {
   const arrowIndex = source.indexOf("=>");
   if (arrowIndex >= 0) {
@@ -300,6 +373,10 @@ function extractFunctionBody(source) {
   return source.trim();
 }
 
+/**
+ * @param {string} body
+ * @returns {string}
+ */
 function trimReturnAndSemicolon(body) {
   let value = body.trim();
   if (value.startsWith("return ")) {
@@ -311,6 +388,11 @@ function trimReturnAndSemicolon(body) {
   return value;
 }
 
+/**
+ * @param {string} body
+ * @param {string} prefix
+ * @returns {boolean}
+ */
 function isDirectLiteralCall(body, prefix) {
   if (!body.startsWith(prefix) || !body.endsWith(")")) {
     return false;
@@ -320,6 +402,11 @@ function isDirectLiteralCall(body, prefix) {
   return looksLiteralPayload(payload);
 }
 
+/**
+ * @param {string} body
+ * @param {string} method
+ * @returns {boolean}
+ */
 function isDirectStatusLiteralCall(body, method) {
   if (!body.startsWith("res.status(") || !body.endsWith(")")) {
     return false;
@@ -335,6 +422,13 @@ function isDirectStatusLiteralCall(body, method) {
   return looksLiteralPayload(payload);
 }
 
+/**
+ * Check if a payload string looks like a JS literal value
+ * (object, array, string, number, boolean, or null).
+ *
+ * @param {string} payload
+ * @returns {boolean}
+ */
 function looksLiteralPayload(payload) {
   if (!payload) {
     return false;
@@ -357,14 +451,72 @@ function looksLiteralPayload(payload) {
   return payload === "true" || payload === "false" || payload === "null";
 }
 
+/**
+ * Build a stable fingerprint for a response snapshot using FNV-1a hashing.
+ * Avoids the overhead of JSON.stringify + base64 that the previous
+ * implementation used on every dispatch.
+ *
+ * @param {Object} snapshot - Response snapshot { status, headers, body }
+ * @returns {string} Hash-based cache key
+ */
 function buildResponseKey(snapshot) {
-  return JSON.stringify({
-    status: snapshot.status,
-    headers: snapshot.headers,
-    bodyBase64: Buffer.from(snapshot.body ?? []).toString("base64"),
-  });
+  let hash = 0x811c9dc5;
+  hash = fnv1aString(hash, String(snapshot.status ?? 200));
+
+  const headers = snapshot.headers ?? Object.create(null);
+  const headerNames = Object.keys(headers);
+  for (const name of headerNames) {
+    hash = fnv1aString(hash, name);
+    hash = fnv1aString(hash, String(headers[name]));
+  }
+
+  const body = Buffer.isBuffer(snapshot.body)
+    ? snapshot.body
+    : snapshot.body instanceof Uint8Array
+      ? snapshot.body
+      : Buffer.alloc(0);
+  hash = fnv1aBytes(hash, body);
+
+  return `${hash}:${body.length}:${headerNames.length}`;
 }
 
+/**
+ * FNV-1a hash over a string (character codes).
+ *
+ * @param {number} seed
+ * @param {string} value
+ * @returns {number}
+ */
+function fnv1aString(seed, value) {
+  let hash = seed >>> 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+/**
+ * FNV-1a hash over a byte buffer.
+ *
+ * @param {number}               seed
+ * @param {Buffer|Uint8Array}    bytes
+ * @returns {number}
+ */
+function fnv1aBytes(seed, bytes) {
+  let hash = seed >>> 0;
+  for (let index = 0; index < bytes.length; index += 1) {
+    hash ^= bytes[index];
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+/**
+ * @param {boolean} notify
+ * @param {Object}  _entry
+ * @param {string}  message
+ */
 function maybeNotify(notify, _entry, message) {
   if (!notify) {
     return;
@@ -373,6 +525,14 @@ function maybeNotify(notify, _entry, message) {
   console.log(`[http-native][opt] ${message}`);
 }
 
+/**
+ * Check whether requestPath starts with the given pathPrefix.
+ * Duplicated from index.js to avoid circular imports — keep in sync.
+ *
+ * @param {string} pathPrefix
+ * @param {string} requestPath
+ * @returns {boolean}
+ */
 function pathPrefixMatches(pathPrefix, requestPath) {
   if (pathPrefix === "/") {
     return true;

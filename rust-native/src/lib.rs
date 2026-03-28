@@ -3,7 +3,6 @@ mod manifest;
 mod router;
 
 use anyhow::{anyhow, Context, Result};
-use bytes::Bytes;
 use memchr::memmem;
 use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
 use monoio::net::{ListenerOpts, TcpListener, TcpStream};
@@ -51,6 +50,8 @@ const MAX_URL_LENGTH: usize = 8192;
 const MAX_HEADER_VALUE_LENGTH: usize = 8192;
 /// Security: Maximum request body size (1 MB)
 const MAX_BODY_BYTES: usize = 1024 * 1024;
+/// Security: Maximum concurrent connections per worker thread
+const MAX_CONNECTIONS_PER_WORKER: usize = 4096;
 
 /// Buffer pool: initial capacity for connection read buffers
 const BUFFER_INITIAL_CAPACITY: usize = 8192;
@@ -274,6 +275,7 @@ pub fn start_server(
             let startup_tx_error = thread_startup_tx.clone();
             let result = (|| -> Result<()> {
                 let mut runtime = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                    .enable_timer()
                     .build()
                     .context("failed to build monoio runtime")?;
 
@@ -363,7 +365,11 @@ fn worker_count_for(options: &NativeListenOptions) -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|count| *count > 0)
-        .unwrap_or(1)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        })
 }
 
 // ─── JS Dispatcher ──────────────────────
@@ -395,6 +401,8 @@ async fn run_server(
     server_config: Arc<HttpServerConfig>,
     shutdown_flag: Arc<AtomicBool>,
 ) -> Result<()> {
+    let active_connections: std::cell::Cell<usize> = std::cell::Cell::new(0);
+
     loop {
         if shutdown_flag.load(Ordering::Acquire) {
             break;
@@ -406,6 +414,12 @@ async fn run_server(
                     break;
                 }
 
+                // Security (S3): enforce per-worker connection limit
+                if active_connections.get() >= MAX_CONNECTIONS_PER_WORKER {
+                    drop(stream);
+                    continue;
+                }
+
                 if let Err(error) = stream.set_nodelay(true) {
                     eprintln!("[http-native] failed to enable TCP_NODELAY: {error}");
                 }
@@ -413,6 +427,10 @@ async fn run_server(
                 let router = Arc::clone(&router);
                 let dispatcher = Arc::clone(&dispatcher);
                 let server_config = Arc::clone(&server_config);
+                active_connections.set(active_connections.get() + 1);
+
+                // Safety: monoio is single-threaded per worker, so Cell is fine here
+                let conn_counter = &active_connections as *const std::cell::Cell<usize>;
 
                 monoio::spawn(async move {
                     if let Err(error) =
@@ -420,6 +438,10 @@ async fn run_server(
                     {
                         eprintln!("[http-native] connection error: {error}");
                     }
+                    // Safety: single-threaded — pointer is always valid while server runs
+                    unsafe { &*conn_counter }.set(
+                        unsafe { &*conn_counter }.get().saturating_sub(1),
+                    );
                 });
             }
             Err(error) => {
@@ -445,9 +467,19 @@ struct ParsedRequest<'a> {
     header_bytes: usize,
     has_body: bool,
     content_length: Option<usize>,
+    /// True when a non-identity Transfer-Encoding header was seen
+    has_chunked_te: bool,
     /// Pre-parsed header pairs — stored once, used by both routing and bridge
     headers: Vec<(&'a str, &'a str)>,
 }
+
+use monoio::time::timeout;
+use std::time::Duration;
+
+const TIMEOUT_HEADER_READ: Duration = Duration::from_secs(30);
+const TIMEOUT_IDLE_KEEPALIVE: Duration = Duration::from_secs(120);
+const TIMEOUT_BODY_READ: Duration = Duration::from_secs(60);
+const TIMEOUT_WRITE: Duration = Duration::from_secs(30);
 
 // ─── Connection Handler with Buffer Pool 
 
@@ -479,6 +511,8 @@ async fn handle_connection_inner(
     dispatcher: &JsDispatcher,
     server_config: &HttpServerConfig,
 ) -> Result<()> {
+    let mut is_first_request = true;
+
     loop {
         // Try hot-path parsing first (GET / with known prefix)
         let parsed = loop {
@@ -501,13 +535,29 @@ async fn handle_connection_inner(
 
             // SAFETY: We take ownership of the buffer, read into it, then put it back
             let owned_buf = std::mem::take(buffer);
-            let (read_result, next_buffer) = stream.read(owned_buf).await;
+            let read_duration = if is_first_request {
+                TIMEOUT_HEADER_READ
+            } else {
+                TIMEOUT_IDLE_KEEPALIVE
+            };
+            
+            let timeout_result = timeout(read_duration, stream.read(owned_buf)).await;
+            let (read_result, next_buffer) = match timeout_result {
+                Ok(res) => res,
+                Err(_) => {
+                    // Read timeout
+                    return Ok(());
+                }
+            };
+            
             *buffer = next_buffer;
             let bytes_read = read_result?;
 
             if bytes_read == 0 {
                 return Ok(());
             }
+
+            is_first_request = false;
 
             if buffer.len() > server_config.max_header_bytes {
                 // Security: Request header too large
@@ -516,8 +566,10 @@ async fn handle_connection_inner(
                     b"{\"error\":\"Request Header Fields Too Large\"}",
                     false,
                 );
-                let (write_result, _) = stream.write_all(response).await;
-                write_result?;
+                let timeout_result = timeout(TIMEOUT_WRITE, stream.write_all(response)).await;
+                if let Ok((write_result, _)) = timeout_result {
+                    write_result?;
+                }
                 stream.shutdown().await?;
                 return Ok(());
             }
@@ -527,6 +579,25 @@ async fn handle_connection_inner(
         let keep_alive = parsed.keep_alive;
         let has_body = parsed.has_body;
         let content_length = parsed.content_length;
+
+        // Security (S1): reject requests with non-identity Transfer-Encoding
+        if parsed.has_chunked_te {
+            drop(parsed);
+            drain_consumed_bytes(buffer, header_bytes);
+            let (status, body) = if content_length.is_some() {
+                // TE + CL = request smuggling vector
+                (400u16, &b"{\"error\":\"Bad Request: conflicting Content-Length and Transfer-Encoding\"}"[..])
+            } else {
+                (501u16, &b"{\"error\":\"Not Implemented: chunked transfer encoding is not supported\"}"[..])
+            };
+            let response = build_error_response_bytes(status, body, false);
+            let timeout_result = timeout(TIMEOUT_WRITE, stream.write_all(response)).await;
+            if let Ok((write_result, _)) = timeout_result {
+                write_result?;
+            }
+            stream.shutdown().await?;
+            return Ok(());
+        }
 
         // ── Fast path: static routes (zero-copy from borrowed parse data) ──
         if !has_body && parsed.method == b"GET" {
@@ -563,13 +634,21 @@ async fn handle_connection_inner(
             drain_consumed_bytes(buffer, header_bytes);
 
             match dispatch_decision {
-                DispatchDecision::BridgeRequest(request) => {
-                    write_dynamic_dispatch_response(stream, dispatcher, request, keep_alive)
+                DispatchDecision::BridgeRequest(request, cache_insertion) => {
+                    write_dynamic_dispatch_response(stream, dispatcher, request, keep_alive, cache_insertion)
                         .await?;
                 }
                 DispatchDecision::SpecializedResponse(response) => {
-                    let (write_result, _) = stream.write_all(response).await;
-                    write_result?;
+                    let timeout_result = timeout(TIMEOUT_WRITE, stream.write_all(response)).await;
+                    if let Ok((write_result, _)) = timeout_result {
+                        write_result?;
+                    }
+                }
+                DispatchDecision::CachedResponse(response) => {
+                    let timeout_result = timeout(TIMEOUT_WRITE, stream.write_all(response)).await;
+                    if let Ok((write_result, _)) = timeout_result {
+                        write_result?;
+                    }
                 }
             }
 
@@ -598,8 +677,10 @@ async fn handle_connection_inner(
                 None => {
                     let response =
                         build_error_response_bytes(411, b"{\"error\":\"Length Required\"}", false);
-                    let (write_result, _) = stream.write_all(response).await;
-                    write_result?;
+                    let timeout_result = timeout(TIMEOUT_WRITE, stream.write_all(response)).await;
+                    if let Ok((write_result, _)) = timeout_result {
+                        write_result?;
+                    }
                     stream.shutdown().await?;
                     return Ok(());
                 }
@@ -608,8 +689,10 @@ async fn handle_connection_inner(
             if content_length > MAX_BODY_BYTES {
                 let response =
                     build_error_response_bytes(413, b"{\"error\":\"Payload Too Large\"}", false);
-                let (write_result, _) = stream.write_all(response).await;
-                write_result?;
+                let timeout_result = timeout(TIMEOUT_WRITE, stream.write_all(response)).await;
+                if let Ok((write_result, _)) = timeout_result {
+                    write_result?;
+                }
                 stream.shutdown().await?;
                 return Ok(());
             }
@@ -634,7 +717,11 @@ async fn handle_connection_inner(
                 while body.len() < content_length {
                     let remaining = content_length - body.len();
                     let chunk_buf = vec![0u8; remaining.min(65536)];
-                    let (read_result, returned_buf) = stream.read(chunk_buf).await;
+                    let timeout_result = timeout(TIMEOUT_BODY_READ, stream.read(chunk_buf)).await;
+                    let (read_result, returned_buf) = match timeout_result {
+                        Ok(res) => res,
+                        Err(_) => return Ok(()),
+                    };
                     let bytes_read = read_result?;
                     if bytes_read == 0 {
                         return Ok(());
@@ -646,7 +733,7 @@ async fn handle_connection_inner(
             }
         };
 
-        let dispatch_request = build_dispatch_request_owned(
+        let dispatch_decision_owned = build_dispatch_decision_owned(
             router,
             &method_owned,
             &target_owned,
@@ -655,7 +742,23 @@ async fn handle_connection_inner(
             &body_bytes,
         )?;
 
-        write_dynamic_dispatch_response(stream, dispatcher, dispatch_request, keep_alive).await?;
+        match dispatch_decision_owned {
+            DispatchDecision::BridgeRequest(request, cache_insertion) => {
+                write_dynamic_dispatch_response(stream, dispatcher, request, keep_alive, cache_insertion).await?;
+            }
+            DispatchDecision::SpecializedResponse(response) => {
+                let timeout_result = timeout(TIMEOUT_WRITE, stream.write_all(response)).await;
+                if let Ok((write_result, _)) = timeout_result {
+                    write_result?;
+                }
+            }
+            DispatchDecision::CachedResponse(response) => {
+                let timeout_result = timeout(TIMEOUT_WRITE, stream.write_all(response)).await;
+                if let Ok((write_result, _)) = timeout_result {
+                    write_result?;
+                }
+            }
+        }
 
         if !keep_alive {
             stream.shutdown().await?;
@@ -695,6 +798,7 @@ fn parse_request_httparse(bytes: &[u8]) -> Option<ParsedRequest<'_>> {
     let mut keep_alive = version >= 1; // HTTP/1.1+ defaults to keep-alive
     let mut has_body = false;
     let mut content_length: Option<usize> = None;
+    let mut has_chunked_te = false;
     let mut headers = Vec::with_capacity(req.headers.len());
 
     for header in req.headers.iter() {
@@ -739,6 +843,7 @@ fn parse_request_httparse(bytes: &[u8]) -> Option<ParsedRequest<'_>> {
             let trimmed = value.trim();
             if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("identity") {
                 has_body = true;
+                has_chunked_te = true;
             }
         }
 
@@ -753,6 +858,7 @@ fn parse_request_httparse(bytes: &[u8]) -> Option<ParsedRequest<'_>> {
         header_bytes: header_len,
         has_body,
         content_length,
+        has_chunked_te,
         headers,
     })
 }
@@ -829,7 +935,8 @@ fn parse_hot_root_request(
         header_bytes: header_end + 4,
         has_body,
         content_length: None,
-        headers: Vec::new(), // Hot path: no headers needed for static response
+        has_chunked_te: false,
+        headers: Vec::new(),
     })
 }
 
@@ -843,8 +950,9 @@ fn parse_hot_root_request(
 /// avoiding all String/Vec allocations for method, target, path, and headers.
 /// Used for non-body requests (GET, DELETE without body, etc.).
 enum DispatchDecision {
-    BridgeRequest(Buffer),
+    BridgeRequest(Buffer, Option<(u32, u64, usize, u64)>),
     SpecializedResponse(Vec<u8>),
+    CachedResponse(bytes::Bytes),
 }
 
 fn build_dispatch_decision_zero_copy(
@@ -867,7 +975,7 @@ fn build_dispatch_decision_zero_copy(
             &parsed.headers,
             body,
         )
-        .map(DispatchDecision::BridgeRequest);
+        .map(|envelope| DispatchDecision::BridgeRequest(envelope, None));
     }
 
     let matched_route = if method_code == UNKNOWN_METHOD_CODE {
@@ -884,8 +992,17 @@ fn build_dispatch_decision_zero_copy(
             &parsed.headers,
             body,
         )
-        .map(DispatchDecision::BridgeRequest);
+        .map(|envelope| DispatchDecision::BridgeRequest(envelope, None));
     };
+    
+    let mut cache_insertion = None;
+    if let Some(cfg) = matched_route.cache_config {
+         let key = crate::router::interpolate_cache_key(cfg, parsed, url_str, matched_route.param_names, &matched_route.param_values);
+         if let Some(cached_response) = crate::router::get_cached_response(matched_route.handler_id, key, parsed.keep_alive) {
+             return Ok(DispatchDecision::CachedResponse(cached_response));
+         }
+         cache_insertion = Some((matched_route.handler_id, key, cfg.max_entries, cfg.ttl_secs));
+    }
 
     if let Some(response) =
         build_dynamic_fast_path_response(&matched_route, url_str, &parsed.headers, parsed.keep_alive)?
@@ -901,17 +1018,17 @@ fn build_dispatch_decision_zero_copy(
         &parsed.headers,
         body,
     )
-    .map(DispatchDecision::BridgeRequest)
+    .map(|envelope| DispatchDecision::BridgeRequest(envelope, cache_insertion))
 }
 
-fn build_dispatch_request_owned(
+fn build_dispatch_decision_owned(
     router: &Router,
     method: &[u8],
     target: &[u8],
     path: &[u8],
     headers: &[(String, String)],
     body: &[u8],
-) -> Result<Buffer> {
+) -> Result<DispatchDecision> {
     let method_code = method_code_from_bytes(method).unwrap_or(UNKNOWN_METHOD_CODE);
 
     let path_cow = String::from_utf8_lossy(path);
@@ -933,7 +1050,8 @@ fn build_dispatch_request_owned(
             url_str,
             &header_refs,
             body,
-        );
+        )
+        .map(|envelope| DispatchDecision::BridgeRequest(envelope, None));
     }
 
     let matched_route = if method_code == UNKNOWN_METHOD_CODE {
@@ -949,8 +1067,31 @@ fn build_dispatch_request_owned(
             url_str,
             &header_refs,
             body,
-        );
+        )
+        .map(|envelope| DispatchDecision::BridgeRequest(envelope, None));
     };
+    
+    let mut cache_insertion = None;
+    if let Some(cfg) = matched_route.cache_config {
+         // Create a mock ParsedRequest for interpolate_cache_key
+         let mock_parsed = ParsedRequest {
+             method,
+             target,
+             path,
+             keep_alive: false,
+             header_bytes: 0,
+             has_body: true,
+             content_length: None,
+             has_chunked_te: false,
+             headers: header_refs.clone(),
+         };
+         let key = crate::router::interpolate_cache_key(cfg, &mock_parsed, url_str, matched_route.param_names, &matched_route.param_values);
+         
+         // Keep alive lookup is fine, we don't know it since keep_alive wasn't passed, wait!
+         // Wait, we can pass keep_alive into this fun. For now assume we don't know keep_alive. Actually, we do! 
+         // Let's defer cached returned to handle_connection_inner instead and just pass out cache_insertion.
+         cache_insertion = Some((matched_route.handler_id, key, cfg.max_entries, cfg.ttl_secs));
+    }
 
     build_dispatch_envelope(
         &matched_route,
@@ -960,6 +1101,7 @@ fn build_dispatch_request_owned(
         &header_refs,
         body,
     )
+    .map(|envelope| DispatchDecision::BridgeRequest(envelope, cache_insertion))
 }
 
 fn build_not_found_dispatch_envelope(
@@ -1418,8 +1560,10 @@ async fn write_exact_static_response(
         static_route.close_response.clone()
     };
 
-    let (write_result, _) = stream.write_all(response).await;
-    write_result?;
+    let timeout_result = timeout(TIMEOUT_WRITE, stream.write_all(response)).await;
+    if let Ok((write_result, _)) = timeout_result {
+        write_result?;
+    }
     Ok(())
 }
 
@@ -1428,13 +1572,39 @@ async fn write_dynamic_dispatch_response(
     dispatcher: &JsDispatcher,
     request: Buffer,
     keep_alive: bool,
+    cache_insertion: Option<(u32, u64, usize, u64)>,
 ) -> Result<()> {
     match dispatcher.dispatch(request).await {
         Ok(response) => {
             match build_http_response_from_dispatch(response.as_ref(), keep_alive) {
                 Ok(http_response) => {
-                    let (write_result, _) = stream.write_all(http_response).await;
-                    write_result?;
+                    if let Some((handler_id, cache_key, max_entries, ttl_secs)) = cache_insertion {
+                        let response_bytes_close: bytes::Bytes = if !keep_alive {
+                            http_response.clone().into()
+                        } else {
+                            build_http_response_from_dispatch(response.as_ref(), false)
+                                .unwrap_or_default()
+                                .into()
+                        };
+                        let response_ka: bytes::Bytes = if keep_alive {
+                            http_response.clone().into()
+                        } else {
+                            build_http_response_from_dispatch(response.as_ref(), true)
+                                .unwrap_or_default()
+                                .into()
+                        };
+                        
+                        crate::router::insert_cached_response(handler_id, cache_key, crate::router::CacheEntry {
+                            response_bytes: response_ka,
+                            response_bytes_close,
+                            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(ttl_secs),
+                        }, max_entries);
+                    }
+                    
+                    let timeout_result = timeout(TIMEOUT_WRITE, stream.write_all(http_response)).await;
+                    if let Ok((write_result, _)) = timeout_result {
+                        write_result?;
+                    }
                 }
                 Err(_) => {
                     // Security: sanitized error — no internal details
@@ -1443,8 +1613,10 @@ async fn write_dynamic_dispatch_response(
                         b"{\"error\":\"Internal Server Error\"}",
                         keep_alive,
                     );
-                    let (write_result, _) = stream.write_all(response).await;
-                    write_result?;
+                    let timeout_result = timeout(TIMEOUT_WRITE, stream.write_all(response)).await;
+                    if let Ok((write_result, _)) = timeout_result {
+                        write_result?;
+                    }
                 }
             }
         }
@@ -1455,8 +1627,10 @@ async fn write_dynamic_dispatch_response(
                 b"{\"error\":\"Bad Gateway\"}",
                 keep_alive,
             );
-            let (write_result, _) = stream.write_all(response).await;
-            write_result?;
+            let timeout_result = timeout(TIMEOUT_WRITE, stream.write_all(response)).await;
+            if let Ok((write_result, _)) = timeout_result {
+                write_result?;
+            }
         }
     }
     Ok(())
@@ -1538,98 +1712,52 @@ fn build_http_response_from_dispatch(dispatch_bytes: &[u8], keep_alive: bool) ->
 
 /// Build a simple error response without going through the JS bridge
 fn build_error_response_bytes(status: u16, body: &[u8], keep_alive: bool) -> Vec<u8> {
-    build_response_bytes(
-        status,
-        &[(
-            "content-type".to_string(),
-            "application/json; charset=utf-8".to_string(),
-        )],
-        Bytes::copy_from_slice(body),
-        keep_alive,
-    )
-}
-
-/// Optimized response builder: pre-calculates size and writes in a single pass
-fn build_response_bytes(
-    status: u16,
-    headers: &[(String, String)],
-    body: Bytes,
-    keep_alive: bool,
-) -> Vec<u8> {
     let reason = status_reason(status);
     let connection = if keep_alive { "keep-alive" } else { "close" };
     let body_len = body.len();
 
-    // Pre-calculate total size to avoid reallocations
-    // "HTTP/1.1 " + status(3) + " " + reason + "\r\n" + "content-length: " + digits + "\r\n" + "connection: " + conn + "\r\n"
-    let mut total_size =
-        9 + 3 + 1 + reason.len() + 2 + 16 + count_digits(body_len) + 2 + 12 + connection.len() + 2;
-
-    for (name, value) in headers {
-        if name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("connection") {
-            continue;
-        }
-        // Security: skip headers with CRLF injection
-        if name.contains('\r')
-            || name.contains('\n')
-            || value.contains('\r')
-            || value.contains('\n')
-        {
-            continue;
-        }
-        total_size += name.len() + 2 + value.len() + 2;
-    }
-
-    total_size += 2 + body_len; // final \r\n + body
+    let total_size =
+        9 + 3 + 1 + reason.len() + 2 + 16 + count_digits(body_len) + 2 + 12 + connection.len() + 2 + 45 + 2 + body_len;
 
     let mut output = Vec::with_capacity(total_size);
-
-    // Status line
     output.extend_from_slice(b"HTTP/1.1 ");
     write_u16(&mut output, status);
     output.push(b' ');
     output.extend_from_slice(reason.as_bytes());
-    output.extend_from_slice(b"\r\n");
-
-    // Mandatory headers
-    output.extend_from_slice(b"content-length: ");
+    output.extend_from_slice(b"\r\ncontent-length: ");
     write_usize(&mut output, body_len);
-    output.extend_from_slice(b"\r\n");
-    output.extend_from_slice(b"connection: ");
+    output.extend_from_slice(b"\r\nconnection: ");
     output.extend_from_slice(connection.as_bytes());
-    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(b"\r\ncontent-type: application/json; charset=utf-8\r\n\r\n");
+    output.extend_from_slice(body);
 
-    // User headers
-    for (name, value) in headers {
-        if name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("connection") {
-            continue;
-        }
-        if name.contains('\r')
-            || name.contains('\n')
-            || value.contains('\r')
-            || value.contains('\n')
-        {
-            continue;
-        }
-        output.extend_from_slice(name.as_bytes());
-        output.extend_from_slice(b": ");
-        output.extend_from_slice(value.as_bytes());
-        output.extend_from_slice(b"\r\n");
-    }
-
-    output.extend_from_slice(b"\r\n");
-    output.extend_from_slice(body.as_ref());
     output
 }
+
 
 // ─── Security Utilities ─────────────────
 
 /// Check for path traversal attempts (../, ..\, etc.)
 fn contains_path_traversal(path: &str) -> bool {
-    // Decode percent-encoded dots
-    let decoded = path.replace("%2e", ".").replace("%2E", ".");
+    if path.contains('\0') || path.contains("%00") {
+        return true;
+    }
 
-    // Check for traversal patterns
+    let mut decoded = path.to_string();
+    for _ in 0..3 {
+        let next = decoded
+            .replace("%2e", ".")
+            .replace("%2E", ".")
+            .replace("%2f", "/")
+            .replace("%2F", "/")
+            .replace("%5c", "\\")
+            .replace("%5C", "\\");
+        if next == decoded {
+            break;
+        }
+        decoded = next;
+    }
+
     decoded.contains("/../")
         || decoded.contains("\\..\\")
         || decoded.ends_with("/..")
@@ -1683,6 +1811,11 @@ fn drain_consumed_bytes(buffer: &mut Vec<u8>, consumed: usize) {
     }
 
     let remaining = buffer.len() - consumed;
+    if remaining == 0 {
+        buffer.clear();
+        return;
+    }
+
     buffer.copy_within(consumed.., 0);
     buffer.truncate(remaining);
 }
@@ -1770,16 +1903,28 @@ fn status_reason(status: u16) -> &'static str {
         201 => "Created",
         202 => "Accepted",
         204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
+        405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        409 => "Conflict",
         411 => "Length Required",
         413 => "Payload Too Large",
         415 => "Unsupported Media Type",
+        422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
+        501 => "Not Implemented",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
-        _ => "OK",
+        504 => "Gateway Timeout",
+        _ => "Unknown",
     }
 }
 

@@ -1,9 +1,10 @@
 /**
  * http-native Validation Middleware
  *
- * Schema-agnostic: works with Zod, TypeBox, Yup, Joi, or any object with .parse()
+ * Schema-agnostic: works with Zod, TypeBox, Yup, Joi, or any object
+ * that exposes .parse(), .safeParse(), or .validate().
  *
- * Usage:
+ * @example
  *   import { validate } from "http-native/validate";
  *   import { z } from "zod";
  *
@@ -16,17 +17,25 @@
  */
 
 /**
+ * Create a validation middleware that parses and validates request
+ * data against the provided schemas before the route handler runs.
+ *
+ * Validated results are placed on the request object:
+ *   - req.validatedParams (if params schema provided)
+ *   - req.validatedQuery  (if query schema provided)
+ *   - req.validatedBody   (if body schema provided)
+ *
  * @param {Object} schema
- * @param {Object} [schema.body] - Schema to validate req.json() against
- * @param {Object} [schema.query] - Schema to validate req.query against
+ * @param {Object} [schema.body]   - Schema to validate req.json() against
+ * @param {Object} [schema.query]  - Schema to validate req.query against
  * @param {Object} [schema.params] - Schema to validate req.params against
+ * @returns {Function} Async middleware: (req, res, next) => Promise<void>
  */
 export function validate(schema = {}) {
   const { body: bodySchema, query: querySchema, params: paramsSchema } = schema;
 
   return async function validationMiddleware(req, res, next) {
     try {
-      // Validate params
       if (paramsSchema) {
         const result = parseSchema(paramsSchema, req.params, "params");
         if (result.error) {
@@ -40,7 +49,6 @@ export function validate(schema = {}) {
         req.validatedParams = result.value;
       }
 
-      // Validate query
       if (querySchema) {
         const result = parseSchema(querySchema, req.query, "query");
         if (result.error) {
@@ -54,7 +62,6 @@ export function validate(schema = {}) {
         req.validatedQuery = result.value;
       }
 
-      // Validate body
       if (bodySchema) {
         const bodyData = req.json();
         if (bodyData === null && bodySchema) {
@@ -80,7 +87,6 @@ export function validate(schema = {}) {
 
       await next();
     } catch (error) {
-      // JSON parse error or schema error
       res.status(400).json({
         error: "Validation Error",
         details: error instanceof Error ? error.message : String(error),
@@ -90,20 +96,23 @@ export function validate(schema = {}) {
 }
 
 /**
- * Schema-agnostic parser. Supports:
- * - Zod: schema.parse() throws ZodError
- * - Zod safe: schema.safeParse() returns { success, data, error }
- * - TypeBox/Ajv: schema.parse() or custom
- * - Any object with .parse(data) that returns the parsed value or throws
+ * Parse data against a schema, supporting multiple schema-library formats:
+ *   - Zod safeParse: schema.safeParse(data) → { success, data, error }
+ *   - Zod / TypeBox parse: schema.parse(data) throws on failure
+ *   - Joi validate: schema.validate(data) → { value, error }
+ *
+ * @param {Object} schema     - Schema object with .parse(), .safeParse(), or .validate()
+ * @param {*}      data       - The data to validate
+ * @param {string} _fieldName - Field name for diagnostics (reserved for future use)
+ * @returns {{ value: *|null, error: *|null }}
+ * @throws {TypeError} If the schema has no recognized parse method
  */
 function parseSchema(schema, data, _fieldName) {
-  // Zod-style safeParse
   if (typeof schema.safeParse === "function") {
     const result = schema.safeParse(data);
     if (result.success) {
       return { value: result.data, error: null };
     }
-    // Zod error format
     const details = result.error?.issues
       ? result.error.issues.map((issue) => ({
           path: issue.path?.join(".") ?? "",
@@ -113,13 +122,11 @@ function parseSchema(schema, data, _fieldName) {
     return { value: null, error: details };
   }
 
-  // Standard .parse() — throws on error
   if (typeof schema.parse === "function") {
     try {
       const value = schema.parse(data);
       return { value, error: null };
     } catch (error) {
-      // Zod throws ZodError with .issues
       if (error?.issues) {
         const details = error.issues.map((issue) => ({
           path: issue.path?.join(".") ?? "",
@@ -131,7 +138,6 @@ function parseSchema(schema, data, _fieldName) {
     }
   }
 
-  // Joi-style .validate()
   if (typeof schema.validate === "function") {
     const result = schema.validate(data);
     if (result.error) {
