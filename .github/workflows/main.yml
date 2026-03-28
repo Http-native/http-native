@@ -29,6 +29,10 @@ on:
         description: "Bombardier timeout"
         required: false
         default: "2s"
+      http_native_runtime:
+        description: 'Runtime for http-native target: "bun" or "node"'
+        required: false
+        default: "bun"
 
 jobs:
   benchmark:
@@ -66,7 +70,8 @@ jobs:
             --scenarios="${{ github.event.inputs.scenarios || 'static,dynamic,opt' }}" \
             --connections="${{ github.event.inputs.connections || '200' }}" \
             --duration="${{ github.event.inputs.duration || '10s' }}" \
-            --timeout="${{ github.event.inputs.timeout || '2s' }}"
+            --timeout="${{ github.event.inputs.timeout || '2s' }}" \
+            --http-native-runtime="${{ github.event.inputs.http_native_runtime || 'bun' }}"
 
       - name: Upload benchmark artifacts
         if: always()
