@@ -193,6 +193,9 @@ export interface Application {
   /** Register a global error handler */
   onError(handler: ErrorHandler): Application;
 
+  /** Group routes under a shared path prefix */
+  group(pathPrefix: string, registerGroup: (group: Application) => void): Application;
+
   /** Register a GET route handler */
   get(path: string, handler: RouteHandler): Application;
 

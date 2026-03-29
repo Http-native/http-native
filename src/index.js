@@ -91,6 +91,30 @@ function pathPrefixMatches(pathPrefix, requestPath) {
   return requestPath === pathPrefix || requestPath.startsWith(`${pathPrefix}/`);
 }
 
+function combinePathPrefixes(basePrefix, nextPrefix) {
+  if (basePrefix === "/") {
+    return nextPrefix;
+  }
+
+  if (nextPrefix === "/") {
+    return basePrefix;
+  }
+
+  return `${basePrefix}${nextPrefix}`;
+}
+
+function applyGroupPrefixToRoutePath(routePath, groupPrefix) {
+  if (groupPrefix === "/") {
+    return routePath;
+  }
+
+  if (routePath === "/") {
+    return groupPrefix;
+  }
+
+  return `${groupPrefix}${routePath}`;
+}
+
 function normalizeContentType(type) {
   if (type.includes("/")) {
     return type;
@@ -771,6 +795,11 @@ function createMethodRegistrar(app, method) {
   return (path, optionsOrHandler, maybeHandler) => {
     let options = {};
     let handler;
+    const groupPrefix = app._groupPrefix ?? "/";
+    const scopedPath =
+      typeof path === "string"
+        ? applyGroupPrefixToRoutePath(path, groupPrefix)
+        : path;
 
     if (typeof optionsOrHandler === "function") {
       handler = optionsOrHandler;
@@ -787,13 +816,13 @@ function createMethodRegistrar(app, method) {
     if (method === "ALL") {
       for (const concreteMethod of HTTP_METHODS) {
         app._routes.push(
-          normalizeRouteRegistration(concreteMethod, path, handler, routeOptions),
+          normalizeRouteRegistration(concreteMethod, scopedPath, handler, routeOptions),
         );
       }
       return app;
     }
 
-    app._routes.push(normalizeRouteRegistration(method, path, handler, routeOptions));
+    app._routes.push(normalizeRouteRegistration(method, scopedPath, handler, routeOptions));
     return app;
   };
 }
@@ -861,14 +890,19 @@ export function createApp() {
     _routes: [],
     _middlewares: [],
     _errorHandlers: [],
+    _groupPrefix: "/",
 
     use(pathOrMiddleware, maybeMiddleware) {
       let pathPrefix = "/";
       let handler = pathOrMiddleware;
+      const groupPrefix = this._groupPrefix ?? "/";
 
       if (typeof pathOrMiddleware === "string") {
         pathPrefix = normalizePathPrefix(pathOrMiddleware);
+        pathPrefix = combinePathPrefixes(groupPrefix, pathPrefix);
         handler = maybeMiddleware;
+      } else if (groupPrefix !== "/") {
+        pathPrefix = groupPrefix;
       }
 
       if (typeof handler !== "function") {
@@ -889,6 +923,24 @@ export function createApp() {
 
     error(handler) {
       return this.onError(handler);
+    },
+
+    group(pathPrefix, registerGroup) {
+      if (typeof registerGroup !== "function") {
+        throw new TypeError("group(path, callback) requires a callback function");
+      }
+
+      const normalizedPrefix = normalizePathPrefix(pathPrefix);
+      const previousPrefix = this._groupPrefix ?? "/";
+      this._groupPrefix = combinePathPrefixes(previousPrefix, normalizedPrefix);
+
+      try {
+        registerGroup(this);
+      } finally {
+        this._groupPrefix = previousPrefix;
+      }
+
+      return this;
     },
 
     get: undefined,
