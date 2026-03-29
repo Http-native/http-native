@@ -106,6 +106,8 @@ export interface RuntimeOptimizationOptions {
   notifyIntervalMs?: number;
   /** Enable runtime response cache promotion for deterministic routes */
   cache?: boolean;
+  /** Write dev comments above route declarations with optimization flags (default: true) */
+  devComments?: boolean;
 }
 
 export interface ListenOptions {
@@ -147,6 +149,18 @@ export interface ServerHandle {
 
   /** Gracefully close the server */
   close(): void;
+}
+
+export interface ListenHandle extends Promise<ServerHandle> {
+  /** Override port before the server starts */
+  port(value: number): ListenHandle;
+
+  /**
+   * Override runtime optimization options before the server starts.
+   *
+   * Supports: await app.listen({ port }).opt({ notify: true })
+   */
+  opt(options?: RuntimeOptimizationOptions): ListenHandle;
 }
 
 export interface OptimizationSnapshot {
@@ -201,7 +215,7 @@ export interface Application {
   all(path: string, handler: RouteHandler): Application;
 
   /** Start the server and listen for connections */
-  listen(options?: ListenOptions): Promise<ServerHandle>;
+  listen(options?: ListenOptions): ListenHandle;
 }
 
 /** Create a new http-native application */

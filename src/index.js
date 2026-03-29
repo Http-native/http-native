@@ -1,4 +1,7 @@
 import { Buffer } from "node:buffer";
+import { existsSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   analyzeRequestAccess,
@@ -14,6 +17,8 @@ import { loadNativeModule } from "./native.js";
 import defaultHttpServerConfig, {
   normalizeHttpServerConfig,
 } from "./http-server.config.js";
+import { buildRouteEntry } from "./opt/entry.js";
+import { createRouteDevCommentWriter } from "./dev/comments.js";
 import { createRuntimeOptimizer } from "./opt/runtime.js";
 
 const HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"];
@@ -112,6 +117,7 @@ const RESPONSE_POOL_MAX = 512;
 const responseStatePool = [];
 const responseObjectPool = [];
 const DEFAULT_JSON_SERIALIZER = createJsonSerializer("fallback");
+const CURRENT_MODULE_PATH = fileURLToPath(import.meta.url);
 
 /**
  * Acquire a response-state object from the pool, or allocate a fresh one.
@@ -409,7 +415,12 @@ function isPromiseLike(value) {
 
 // ─── Dispatcher ─────────────────────────
 
-function createDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) {
+function createDispatcher(
+  compiledRoutes,
+  runtimeOptimizer,
+  errorHandlers = [],
+  devRouteCommentWriter = null,
+) {
   const routesById = new Map(compiledRoutes.map((route) => [route.handlerId, route]));
   const errorRequestFactory = createRequestFactory(ERROR_REQUEST_PLAN, [], null);
 
@@ -497,7 +508,12 @@ function createDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) 
     const responseSnapshot = snapshot();
     runtimeOptimizer?.recordDispatch(route, req, responseSnapshot);
     const encoded = encodeResponseEnvelope(responseSnapshot);
-    maybePromoteRouteResponseCache(route, responseSnapshot, encoded);
+    maybePromoteRouteResponseCache(
+      route,
+      responseSnapshot,
+      encoded,
+      devRouteCommentWriter,
+    );
     releaseRequestObject(req);
     release();
     return encoded;
@@ -531,7 +547,58 @@ function normalizeRouteRegistration(method, path, handler, options = {}) {
     path: normalizeRoutePath(method, path),
     handler,
     cache: options.cache || null,
+    sourceLocation: options.sourceLocation ?? null,
   };
+}
+
+function captureRouteRegistrationLocation() {
+  const stack = new Error().stack;
+  if (!stack) {
+    return null;
+  }
+
+  const stackLines = stack.split("\n").slice(1);
+  for (const stackLine of stackLines) {
+    const line = stackLine.trim();
+    if (!line || line.includes("node:internal") || line.includes("internal/")) {
+      continue;
+    }
+
+    const match = line.match(/\(?((?:file:\/\/)?[^)\s]+):(\d+):(\d+)\)?/);
+    if (!match) {
+      continue;
+    }
+
+    const [, rawFilePath, rawLine, rawColumn] = match;
+    let filePath;
+    try {
+      filePath = rawFilePath.startsWith("file://")
+        ? fileURLToPath(rawFilePath)
+        : rawFilePath;
+    } catch {
+      continue;
+    }
+
+    if (!path.isAbsolute(filePath)) {
+      filePath = path.resolve(process.cwd(), filePath);
+    }
+
+    if (!existsSync(filePath)) {
+      continue;
+    }
+
+    if (!filePath || filePath === CURRENT_MODULE_PATH) {
+      continue;
+    }
+
+    return {
+      filePath,
+      line: Number(rawLine),
+      column: Number(rawColumn),
+    };
+  }
+
+  return null;
 }
 
 function compileMiddlewareRegistration(middleware) {
@@ -591,7 +658,7 @@ function hasNoRequestAccess(plan) {
   );
 }
 
-function maybePromoteRouteResponseCache(route, snapshot, encoded) {
+function maybePromoteRouteResponseCache(route, snapshot, encoded, devRouteCommentWriter = null) {
   const cache = route.runtimeResponseCache;
   if (!cache || cache.encoded) {
     return;
@@ -607,6 +674,7 @@ function maybePromoteRouteResponseCache(route, snapshot, encoded) {
 
   if (cache.stableHits >= ROUTE_CACHE_PROMOTE_HITS) {
     cache.encoded = encoded;
+    devRouteCommentWriter?.markRoute(route, "runtime-cache-promoted");
   }
 }
 
@@ -711,16 +779,21 @@ function createMethodRegistrar(app, method) {
       handler = maybeHandler;
     }
 
+    const sourceLocation = captureRouteRegistrationLocation();
+    const routeOptions = sourceLocation
+      ? { ...options, sourceLocation }
+      : options;
+
     if (method === "ALL") {
       for (const concreteMethod of HTTP_METHODS) {
         app._routes.push(
-          normalizeRouteRegistration(concreteMethod, path, handler, options),
+          normalizeRouteRegistration(concreteMethod, path, handler, routeOptions),
         );
       }
       return app;
     }
 
-    app._routes.push(normalizeRouteRegistration(method, path, handler, options));
+    app._routes.push(normalizeRouteRegistration(method, path, handler, routeOptions));
     return app;
   };
 }
@@ -729,6 +802,14 @@ function normalizeListenOptions(options = {}) {
   const serverConfig = normalizeHttpServerConfig(
     options.serverConfig ?? options.httpServerConfig ?? defaultHttpServerConfig,
   );
+  const optionOpt = options.opt ?? null;
+  const normalizedOpt = {
+    notify: optionOpt?.notify ?? true,
+    notifyIntervalMs: optionOpt?.notifyIntervalMs,
+    cache: optionOpt?.cache,
+    devComments:
+      optionOpt?.devComments ?? process.env.HTTP_NATIVE_DEV_COMMENTS !== "0",
+  };
 
   return {
     host: options.host ?? serverConfig.defaultHost,
@@ -737,8 +818,30 @@ function normalizeListenOptions(options = {}) {
       options.backlog === undefined || options.backlog === null
         ? serverConfig.defaultBacklog
         : Number(options.backlog),
-    opt: options.opt ?? {},
+    opt: normalizedOpt,
     serverConfig,
+  };
+}
+
+function registerDevCommentProcessCleanup(devRouteCommentWriter) {
+  if (!devRouteCommentWriter?.cleanup) {
+    return () => undefined;
+  }
+
+  const cleanup = () => {
+    devRouteCommentWriter.cleanup();
+  };
+
+  /**
+   * implmented for now
+   * but it shouldn't work for now cuz its hard to debug then
+   */
+  process.once("beforeExit", cleanup);
+  process.once("exit", cleanup);
+
+  return () => {
+    process.off("beforeExit", cleanup);
+    process.off("exit", cleanup);
   };
 }
 
@@ -796,102 +899,195 @@ export function createApp() {
     options: undefined,
     all: undefined,
 
-    async listen(options = {}) {
-      const normalizedOptions = normalizeListenOptions(options);
-      const compiledMiddlewares = this._middlewares.map(compileMiddlewareRegistration);
-      const errorHandlerPlans = this._errorHandlers.map((handler) =>
-        analyzeRequestAccess(Function.prototype.toString.call(handler)),
-      );
+    listen(options = {}) {
+      const startServer = async (listenOptions = options) => {
+        const normalizedOptions = normalizeListenOptions(listenOptions);
+        const compiledMiddlewares = this._middlewares.map(compileMiddlewareRegistration);
+        const errorHandlerPlans = this._errorHandlers.map((handler) =>
+          analyzeRequestAccess(Function.prototype.toString.call(handler)),
+        );
 
-      const routes = this._routes.map((route) => {
-        const handlerSource = Function.prototype.toString.call(route.handler);
+        const routes = this._routes.map((route) => {
+          const handlerSource = Function.prototype.toString.call(route.handler);
+
+          return {
+            ...route,
+            handlerId: nextHandlerId++,
+            handlerSource,
+            accessPlan: analyzeRequestAccess(handlerSource),
+            ...compileRouteShape(route.method, route.path),
+          };
+        });
+        const compiledRoutes = routes.map((route) =>
+          compileRouteDispatch(
+            route,
+            compiledMiddlewares,
+            errorHandlerPlans,
+            normalizedOptions.opt,
+          ),
+        );
+
+        const manifest = {
+          version: 1,
+          serverConfig: normalizedOptions.serverConfig,
+          middlewares: compiledMiddlewares.map((middleware) => ({
+            pathPrefix: middleware.pathPrefix,
+          })),
+          routes: compiledRoutes.map((route) => ({
+            method: route.method,
+            methodCode: route.methodCode,
+            path: route.path,
+            routeKind: route.routeKind,
+            handlerId: route.handlerId,
+            handlerSource: route.handlerSource,
+            paramNames: route.paramNames,
+            segmentCount: route.segmentCount,
+            headerKeys: [...route.requestPlan.headerKeys],
+            fullHeaders: route.requestPlan.fullHeaders,
+            needsPath: route.requestPlan.path,
+            needsUrl: route.requestPlan.url,
+            needsQuery:
+              route.requestPlan.fullQuery ||
+              route.requestPlan.queryKeys.size > 0,
+            cache: route.cache
+              ? {
+                  ttlSecs: route.cache.ttl || 60,
+                  maxEntries: route.cache.maxEntries || 256,
+                  varyBy: (route.cache.varyBy || []).map((key) => {
+                    const dotIndex = key.indexOf(".");
+                    return dotIndex >= 0
+                      ? { source: key.slice(0, dotIndex), name: key.slice(dotIndex + 1) }
+                      : { source: "query", name: key };
+                  }),
+                }
+              : null,
+          })),
+        };
+
+        const runtimeOptimizer = createRuntimeOptimizer(
+          compiledRoutes,
+          compiledMiddlewares,
+          normalizedOptions.opt,
+        );
+        const devRouteCommentWriter = createRouteDevCommentWriter(normalizedOptions.opt);
+        const detachDevCommentProcessCleanup = registerDevCommentProcessCleanup(
+          devRouteCommentWriter,
+        );
+        if (devRouteCommentWriter) {
+          for (const route of compiledRoutes) {
+            const routeEntry = buildRouteEntry(route, compiledMiddlewares);
+            const baseStatus =
+              routeEntry.staticFastPath === true
+                ? "static-fast-path"
+                : "bridge-dispatch";
+            devRouteCommentWriter.markRoute(route, baseStatus);
+
+            if (route.runtimeResponseCache) {
+              devRouteCommentWriter.markRoute(route, "runtime-cache-tracking");
+            }
+          }
+        }
+
+        const dispatcher = createDispatcher(
+          compiledRoutes,
+          runtimeOptimizer,
+          this._errorHandlers,
+          devRouteCommentWriter,
+        );
+        const handle = native.startServer(JSON.stringify(manifest), dispatcher, {
+          host: normalizedOptions.host,
+          port: normalizedOptions.port,
+          backlog: normalizedOptions.backlog,
+        });
+        ACTIVE_NATIVE_SERVERS.add(handle);
 
         return {
-          ...route,
-          handlerId: nextHandlerId++,
-          handlerSource,
-          accessPlan: analyzeRequestAccess(handlerSource),
-          ...compileRouteShape(route.method, route.path),
+          host: handle.host,
+          port: handle.port,
+          url: handle.url,
+          _handle: handle,
+          optimizations: {
+            snapshot() {
+              return runtimeOptimizer.snapshot();
+            },
+            summary() {
+              return runtimeOptimizer.summary();
+            },
+          },
+          close() {
+            ACTIVE_NATIVE_SERVERS.delete(handle);
+            runtimeOptimizer?.dispose?.();
+            devRouteCommentWriter?.cleanup?.();
+            detachDevCommentProcessCleanup();
+            return handle.close();
+          },
         };
-      });
-      const compiledRoutes = routes.map((route) =>
-        compileRouteDispatch(
-          route,
-          compiledMiddlewares,
-          errorHandlerPlans,
-          normalizedOptions.opt,
-        ),
-      );
-
-      const manifest = {
-        version: 1,
-        serverConfig: normalizedOptions.serverConfig,
-        middlewares: compiledMiddlewares.map((middleware) => ({
-          pathPrefix: middleware.pathPrefix,
-        })),
-        routes: compiledRoutes.map((route) => ({
-          method: route.method,
-          methodCode: route.methodCode,
-          path: route.path,
-          routeKind: route.routeKind,
-          handlerId: route.handlerId,
-          handlerSource: route.handlerSource,
-          paramNames: route.paramNames,
-          segmentCount: route.segmentCount,
-          headerKeys: [...route.requestPlan.headerKeys],
-          fullHeaders: route.requestPlan.fullHeaders,
-          needsPath: route.requestPlan.path,
-          needsUrl: route.requestPlan.url,
-          needsQuery:
-            route.requestPlan.fullQuery ||
-            route.requestPlan.queryKeys.size > 0,
-          cache: route.cache
-            ? {
-                ttlSecs: route.cache.ttl || 60,
-                maxEntries: route.cache.maxEntries || 256,
-                varyBy: (route.cache.varyBy || []).map((key) => {
-                  const dotIndex = key.indexOf(".");
-                  return dotIndex >= 0
-                    ? { source: key.slice(0, dotIndex), name: key.slice(dotIndex + 1) }
-                    : { source: "query", name: key };
-                }),
-              }
-            : null,
-        })),
       };
 
-      const runtimeOptimizer = createRuntimeOptimizer(
-        compiledRoutes,
-        compiledMiddlewares,
-        normalizedOptions.opt,
-      );
-      const dispatcher = createDispatcher(compiledRoutes, runtimeOptimizer, this._errorHandlers);
-      const handle = native.startServer(JSON.stringify(manifest), dispatcher, {
-        host: normalizedOptions.host,
-        port: normalizedOptions.port,
-        backlog: normalizedOptions.backlog,
-      });
-      ACTIVE_NATIVE_SERVERS.add(handle);
+      let selectedPort = options.port;
+      let selectedOpt = options.opt;
+      let startPromise = null;
 
-      return {
-        host: handle.host,
-        port: handle.port,
-        url: handle.url,
-        _handle: handle,
-        optimizations: {
-          snapshot() {
-            return runtimeOptimizer.snapshot();
-          },
-          summary() {
-            return runtimeOptimizer.summary();
-          },
+      const resolveOptions = () => {
+        if (selectedPort === undefined && selectedOpt === undefined) {
+          return options;
+        }
+
+        return {
+          ...options,
+          ...(selectedPort === undefined ? {} : { port: selectedPort }),
+          opt: selectedOpt,
+        };
+      };
+
+      const start = () => {
+        if (!startPromise) {
+          startPromise = startServer(resolveOptions());
+        }
+        return startPromise;
+      };
+
+      const chainableListen = {
+        port(value) {
+          if (startPromise) {
+            return startPromise;
+          }
+
+          selectedPort = Number(value);
+          return chainableListen;
         },
-        close() {
-          ACTIVE_NATIVE_SERVERS.delete(handle);
-          runtimeOptimizer?.dispose?.();
-          return handle.close();
+        opt(optOptions = {}) {
+          if (startPromise) {
+            return startPromise;
+          }
+
+          const safeOptOptions =
+            optOptions && typeof optOptions === "object" ? optOptions : {};
+
+          selectedOpt = {
+            ...(selectedOpt ?? {}),
+            ...safeOptOptions,
+          };
+
+          return chainableListen;
+        },
+        then(onFulfilled, onRejected) {
+          return start().then(onFulfilled, onRejected);
+        },
+        catch(onRejected) {
+          return start().catch(onRejected);
+        },
+        finally(onFinally) {
+          return start().finally(onFinally);
         },
       };
+
+      // Preserve previous behavior by starting even when callers don't await.
+      queueMicrotask(() => {
+        void start();
+      });
+
+      return chainableListen;
     },
   };
 
