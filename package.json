@@ -1,6 +1,6 @@
 {
   "name": "@http-native/core",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "type": "module",
   "publishConfig": {
     "access": "public"
@@ -24,6 +24,7 @@
   "scripts": {
     "build": "bun scripts/build-native.mjs",
     "build:release": "bun scripts/build-native.mjs --release",
+    "dev:hot": "HTTP_NATIVE_HOT_RELOAD=1 bun test/app.ts",
     "test": "bun run build && bun test/test.js",
     "bench": "bun run build:release && bun bench/run.js",
     "bench:http-native:static": "bun run build:release && bun bench/run.js http-native static 3001",

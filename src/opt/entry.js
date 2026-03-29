@@ -4,7 +4,8 @@ export function buildRouteEntry(route, middlewares) {
     pathPrefixMatches(middleware.pathPrefix, route.path),
   );
   const source = route.handlerSource ?? "";
-  const staticFastPath = isStaticFastPathCandidate(route, hasMiddleware, source);
+  const nativeCache = source.includes("res.ncache(");
+  const staticFastPath = !nativeCache && isStaticFastPathCandidate(route, hasMiddleware, source);
   const cacheCandidate =
     !staticFastPath &&
     route.method === "GET" &&
@@ -15,7 +16,9 @@ export function buildRouteEntry(route, middlewares) {
     !/Date\.now|new Date|Math\.random|crypto\./.test(source);
 
   const reasons = [];
-  if (staticFastPath) {
+  if (nativeCache) {
+    reasons.push("response cached natively in Rust after first call");
+  } else if (staticFastPath) {
     reasons.push("served by static fast path");
   } else {
     reasons.push("served through bridge dispatch");
@@ -38,6 +41,7 @@ export function buildRouteEntry(route, middlewares) {
     stage: "cold",
     hits: 0,
     lastHitAt: null,
+    nativeCache,
     staticFastPath,
     binaryBridge: true,
     dispatchKind: route.dispatchKind ?? "generic_fallback",
