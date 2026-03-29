@@ -73,7 +73,7 @@ export async function hot(appModulePath, options = {}) {
       }
       currentServer = null;
       // Wait for the OS to release the port
-      await new Promise((r) => setTimeout(r, 50));
+      await new Promise((r) => setTimeout(r, 200));
     }
 
     try {
@@ -85,12 +85,13 @@ export async function hot(appModulePath, options = {}) {
       const moduleUrl = `${pathToFileURL(absolutePath).href}?v=${version}`;
       const mod = await import(moduleUrl);
 
-      // Wait a tick for any microtask-queued app.listen() to complete
-      await new Promise((r) => setTimeout(r, 10));
+      // Wait for any microtask-queued or setTimeout-deferred app.listen() to complete
+      await new Promise((r) => setTimeout(r, 100));
 
       // Check if the module self-started (called app.listen() during import)
-      if (globalThis.__HTTP_NATIVE_HOT__?.server) {
-        currentServer = globalThis.__HTTP_NATIVE_HOT__.server;
+      const hotCtx = globalThis.__HTTP_NATIVE_HOT__;
+      if (hotCtx?.server) {
+        currentServer = hotCtx.server;
       } else {
         // Module exports the app without calling listen()
         const app = mod.default ?? mod.app ?? mod;
@@ -101,17 +102,12 @@ export async function hot(appModulePath, options = {}) {
             host,
             opt: { notify: false },
           });
-        } else if (app && typeof app.get === "function") {
-          // App was created but not started — start it
-          currentServer = await app.listen({
-            port,
-            host,
-            opt: { notify: false },
-          });
         } else {
+          // Nothing worked — the module probably self-started but we missed
+          // the capture. This can happen if listen() failed silently.
           throw new Error(
-            `Module ${appModulePath} must either export an http-native app or call app.listen(). ` +
-              `Got: ${typeof app}`,
+            `Hot reload failed: the module did not export an app or start a server on port ${port}.\n` +
+              `Either add \`export default app\` to your file, or check for startup errors above.`,
           );
         }
       }
