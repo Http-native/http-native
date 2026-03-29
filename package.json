@@ -1,8 +1,10 @@
 {
-  "name": "http-native",
+  "name": "@http-native/core",
   "version": "0.1.0",
   "type": "module",
-  "private": true,
+  "publishConfig": {
+    "access": "public"
+  },
   "exports": {
     ".": {
       "types": "./src/index.d.ts",
