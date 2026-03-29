@@ -6,13 +6,17 @@ pub mod session;
 use anyhow::{anyhow, Context, Result};
 use memchr::memmem;
 use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
-use monoio::net::{ListenerOpts, TcpListener, TcpStream};
+use monoio::net::{ListenerOpts, TcpListener};
+use monoio_rustls::TlsAcceptor;
 use napi::bindgen_prelude::{Buffer, Function, Promise};
 use napi::threadsafe_function::ThreadsafeFunction;
 use napi::{Error, Status};
 use napi_derive::napi;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::ServerConfig as RustlsServerConfig;
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::io::BufReader;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::rc::Rc;
@@ -23,7 +27,7 @@ use crate::analyzer::{
     DynamicFastPathResponse, DynamicValueSourceKind, JsonTemplateKind, JsonValueTemplate,
     TextSegment,
 };
-use crate::manifest::{HttpServerConfigInput, ManifestInput};
+use crate::manifest::{HttpServerConfigInput, ManifestInput, TlsConfigInput};
 use crate::router::{ExactStaticRoute, MatchedRoute, Router};
 
 // ─── Constants ──────────────────────────
@@ -341,6 +345,8 @@ pub fn start_server(
     let server_config =
         Arc::new(HttpServerConfig::from_manifest(&manifest).map_err(to_napi_error)?);
     let router = Arc::new(Router::from_manifest(&manifest).map_err(to_napi_error)?);
+    let tls_acceptor = build_tls_acceptor(&manifest).map_err(to_napi_error)?;
+    let tls_enabled = tls_acceptor.is_some();
 
     // Build session store if session config is present in manifest
     let session_store: Option<Arc<session::SessionStore>> = manifest.session.as_ref().map(|cfg| {
@@ -380,6 +386,7 @@ pub fn start_server(
         let thread_config = Arc::clone(&server_config);
         let thread_shutdown = Arc::clone(&shutdown_flag);
         let thread_session_store = session_store.clone();
+        let thread_tls_acceptor = tls_acceptor.clone();
         let thread_options = NativeListenOptions {
             host: options.host.clone(),
             port: options.port,
@@ -405,6 +412,7 @@ pub fn start_server(
                         thread_router,
                         thread_dispatcher,
                         thread_config,
+                        thread_tls_acceptor,
                         thread_shutdown,
                         thread_session_store,
                     )
@@ -464,7 +472,11 @@ pub fn start_server(
     Ok(NativeServerHandle {
         host: host.clone(),
         port,
-        url: format!("http://{host}:{port}"),
+        url: if tls_enabled {
+            format!("https://{host}:{port}")
+        } else {
+            format!("http://{host}:{port}")
+        },
         shutdown: Mutex::new(Some(ShutdownHandle {
             flag: shutdown_flag,
             wake_addrs,
@@ -516,6 +528,7 @@ async fn run_server(
     router: Arc<Router>,
     dispatcher: Arc<JsDispatcher>,
     server_config: Arc<HttpServerConfig>,
+    tls_acceptor: Option<TlsAcceptor>,
     shutdown_flag: Arc<AtomicBool>,
     session_store: Option<Arc<session::SessionStore>>,
 ) -> Result<()> {
@@ -524,6 +537,7 @@ async fn run_server(
     let router: Rc<Arc<Router>> = Rc::new(router);
     let dispatcher: Rc<Arc<JsDispatcher>> = Rc::new(dispatcher);
     let server_config: Rc<Arc<HttpServerConfig>> = Rc::new(server_config);
+    let tls_acceptor: Option<Rc<TlsAcceptor>> = tls_acceptor.map(Rc::new);
     let session_store: Option<Rc<Arc<session::SessionStore>>> =
         session_store.map(Rc::new);
 
@@ -553,6 +567,7 @@ async fn run_server(
                 let router = Rc::clone(&router);
                 let dispatcher = Rc::clone(&dispatcher);
                 let server_config = Rc::clone(&server_config);
+                let tls_acceptor = tls_acceptor.clone();
                 let session_store = session_store.clone();
                 active_connections.set(active_connections.get() + 1);
 
@@ -560,9 +575,25 @@ async fn run_server(
                 let conn_counter = &active_connections as *const std::cell::Cell<usize>;
 
                 monoio::spawn(async move {
-                    if let Err(error) =
-                        handle_connection(stream, router, dispatcher, server_config, session_store).await
-                    {
+                    let connection_result = if let Some(acceptor) = tls_acceptor.as_ref() {
+                        match acceptor.accept(stream).await {
+                            Ok(tls_stream) => {
+                                handle_connection(
+                                    tls_stream,
+                                    router,
+                                    dispatcher,
+                                    server_config,
+                                    session_store,
+                                )
+                                .await
+                            }
+                            Err(error) => Err(anyhow!("TLS accept failed: {error}")),
+                        }
+                    } else {
+                        handle_connection(stream, router, dispatcher, server_config, session_store)
+                            .await
+                    };
+                    if let Err(error) = connection_result {
                         eprintln!("[http-native] connection error: {error}");
                     }
                     // Safety: single-threaded — pointer is always valid while server runs
@@ -611,13 +642,16 @@ const TIMEOUT_BODY_READ: Duration = Duration::from_secs(60);
 
 // ─── Connection Handler with Buffer Pool 
 
-async fn handle_connection(
-    mut stream: TcpStream,
+async fn handle_connection<S>(
+    mut stream: S,
     router: Rc<Arc<Router>>,
     dispatcher: Rc<Arc<JsDispatcher>>,
     server_config: Rc<Arc<HttpServerConfig>>,
     session_store: Option<Rc<Arc<session::SessionStore>>>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncReadRent + AsyncWriteRent + Unpin,
+{
     let mut buffer = acquire_buffer();
 
     let result = handle_connection_inner(
@@ -634,14 +668,17 @@ async fn handle_connection(
     result
 }
 
-async fn handle_connection_inner(
-    stream: &mut TcpStream,
+async fn handle_connection_inner<S>(
+    stream: &mut S,
     buffer: &mut Vec<u8>,
     router: &Router,
     dispatcher: &JsDispatcher,
     server_config: &HttpServerConfig,
     session_store: Option<&session::SessionStore>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncReadRent + AsyncWriteRent + Unpin,
+{
     let mut is_first_request = true;
 
     loop {
@@ -1767,11 +1804,14 @@ fn build_response_bytes_fast(
 
 // ─── Response Writing ───────────────────
 
-async fn write_exact_static_response(
-    stream: &mut TcpStream,
+async fn write_exact_static_response<S>(
+    stream: &mut S,
     static_route: &ExactStaticRoute,
     keep_alive: bool,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncWriteRent + Unpin,
+{
     let response = if keep_alive {
         static_route.keep_alive_response.clone()
     } else {
@@ -1984,8 +2024,8 @@ fn extract_session_trailer(dispatch_bytes: &[u8], start_offset: usize) -> Option
     })
 }
 
-async fn write_dynamic_dispatch_response(
-    stream: &mut TcpStream,
+async fn write_dynamic_dispatch_response<S>(
+    stream: &mut S,
     dispatcher: &JsDispatcher,
     request: Buffer,
     keep_alive: bool,
@@ -1995,7 +2035,10 @@ async fn write_dynamic_dispatch_response(
     session_store: Option<&session::SessionStore>,
     session_id: Option<[u8; session::SESSION_ID_BYTES]>,
     is_new_session: bool,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncWriteRent + Unpin,
+{
     match dispatcher.dispatch(request).await {
         Ok(response) => {
             match build_http_response_from_dispatch(response.as_ref(), keep_alive) {
@@ -2450,6 +2493,61 @@ fn bind_listener(
         .with_context(|| format!("failed to bind TCP listener on {bind_addr}"))
 }
 
+fn build_tls_acceptor(manifest: &ManifestInput) -> Result<Option<TlsAcceptor>> {
+    let Some(tls) = manifest.tls.as_ref() else {
+        return Ok(None);
+    };
+
+    let mut cert_chain = parse_tls_certificates(tls.cert.as_str(), "tls.cert")?;
+    if let Some(ca_pem) = tls.ca.as_deref() {
+        let mut ca_chain = parse_tls_certificates(ca_pem, "tls.ca")?;
+        cert_chain.append(&mut ca_chain);
+    }
+
+    let private_key = parse_tls_private_key(tls)?;
+    let mut config = RustlsServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, private_key)
+        .context("failed to construct rustls server config")?;
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    Ok(Some(TlsAcceptor::from(Arc::new(config))))
+}
+
+fn parse_tls_certificates(
+    pem: &str,
+    source_name: &str,
+) -> Result<Vec<CertificateDer<'static>>> {
+    let mut reader = BufReader::new(pem.as_bytes());
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to parse {source_name} PEM"))?;
+
+    if certs.is_empty() {
+        return Err(anyhow!("{source_name} does not contain any certificates"));
+    }
+
+    Ok(certs)
+}
+
+fn parse_tls_private_key(tls: &TlsConfigInput) -> Result<PrivateKeyDer<'static>> {
+    let mut reader = BufReader::new(tls.key.as_bytes());
+    let key = rustls_pemfile::private_key(&mut reader)
+        .context("failed to parse tls.key PEM")?;
+
+    if let Some(private_key) = key {
+        return Ok(private_key);
+    }
+
+    if tls.passphrase.is_some() {
+        return Err(anyhow!(
+            "encrypted TLS private keys are not supported by this loader; provide an unencrypted PEM key"
+        ));
+    }
+
+    Err(anyhow!("tls.key does not contain a supported private key"))
+}
+
 fn resolve_socket_addr(host: &str, port: u16) -> Result<SocketAddr> {
     (host, port)
         .to_socket_addrs()?
@@ -2460,6 +2558,15 @@ fn resolve_socket_addr(host: &str, port: u16) -> Result<SocketAddr> {
 fn validate_manifest(manifest: &ManifestInput) -> Result<()> {
     if manifest.version != 1 {
         return Err(anyhow!("Unsupported manifest version {}", manifest.version));
+    }
+
+    if let Some(tls) = manifest.tls.as_ref() {
+        if tls.cert.trim().is_empty() {
+            return Err(anyhow!("tls.cert is required"));
+        }
+        if tls.key.trim().is_empty() {
+            return Err(anyhow!("tls.key is required"));
+        }
     }
 
     Ok(())

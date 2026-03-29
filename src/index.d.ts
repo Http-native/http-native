@@ -146,10 +146,23 @@ export type ErrorHandler = (
 
 // ─── Listen Options ─────────────────────
 
+export interface TlsConfig {
+  /** Path to PEM certificate file, or PEM string */
+  cert: string;
+  /** Path to PEM private key file, or PEM string */
+  key: string;
+  /** Path to CA bundle file, or PEM string (optional) */
+  ca?: string;
+  /** Passphrase for encrypted private key (optional) */
+  passphrase?: string;
+}
+
 export interface HttpServerConfig {
   defaultHost?: string;
   defaultBacklog?: number;
   maxHeaderBytes?: number;
+  /** TLS/SSL configuration — set to enable HTTPS */
+  tls?: TlsConfig | null;
 }
 
 export interface RuntimeOptimizationOptions {
@@ -161,6 +174,12 @@ export interface RuntimeOptimizationOptions {
   timing?: boolean;
   /** Enable runtime response cache promotion for deterministic routes */
   cache?: boolean;
+  /** Restart process on JS/Rust source changes (dev only, default: false) */
+  hotReload?: boolean;
+  /** Watch roots for hot reload (default: ["src", "rust-native/src", "test"]) */
+  hotReloadPaths?: string[];
+  /** Debounce window for restart triggers in ms (default: 120) */
+  hotReloadDebounceMs?: number;
   /** Write dev comments above route declarations with optimization flags (default: true) */
   devComments?: boolean;
 }
@@ -191,8 +210,11 @@ export interface ServerHandle {
   /** Bound port number */
   readonly port: number;
 
-  /** Full URL (http://host:port) */
+  /** Full URL (http(s)://host:port) */
   readonly url: string;
+
+  /** Whether TLS is enabled */
+  readonly tls: boolean;
 
   /** Runtime optimization introspection */
   readonly optimizations: {
@@ -216,6 +238,15 @@ export interface ListenHandle extends Promise<ServerHandle> {
    * Supports: await app.listen({ port }).opt({ notify: true })
    */
   opt(options?: RuntimeOptimizationOptions): ListenHandle;
+
+  /**
+   * Enable TLS/HTTPS with cert and key.
+   * Accepts file paths or PEM strings.
+   *
+   * @example
+   * await app.listen().port(443).tls({ cert: "./cert.pem", key: "./key.pem" })
+   */
+  tls(config: TlsConfig): ListenHandle;
 }
 
 export interface OptimizationSnapshot {
@@ -248,7 +279,10 @@ export interface Application {
   /** Register a global error / not-found handler */
   error(handler: ErrorHandler): Application;
 
-  /** Register a global error handler */
+  /** 
+   * Deprecate soon
+   * Not very needed rn
+   * Register a global error handler */
   onError(handler: ErrorHandler): Application;
 
   /** Group routes under a shared path prefix */

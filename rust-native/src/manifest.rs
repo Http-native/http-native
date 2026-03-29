@@ -5,10 +5,23 @@ use serde::Deserialize;
 pub struct ManifestInput {
     pub version: u32,
     pub server_config: Option<HttpServerConfigInput>,
+    #[serde(default)]
+    pub tls: Option<TlsConfigInput>,
     pub middlewares: Vec<MiddlewareInput>,
     pub routes: Vec<RouteInput>,
     #[serde(default)]
     pub session: Option<SessionConfigInput>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TlsConfigInput {
+    pub cert: String,
+    pub key: String,
+    #[serde(default)]
+    pub ca: Option<String>,
+    #[serde(default)]
+    pub passphrase: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

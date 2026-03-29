@@ -100,7 +100,7 @@ export function compileRouteShape(method, path) {
   };
 }
 
-// ─── Request Access Analysis ────────────
+
 
 /**
  * Static-analyze a handler/middleware source string to determine which

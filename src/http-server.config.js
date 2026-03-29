@@ -1,3 +1,13 @@
+import { readFileSync } from "node:fs";
+
+/**
+ * @typedef {Object} TlsConfig
+ * @property {string}  cert     - Path to PEM certificate file, or PEM string
+ * @property {string}  key      - Path to PEM private key file, or PEM string
+ * @property {string}  [ca]     - Path to CA bundle file, or PEM string (optional)
+ * @property {string}  [passphrase] - Passphrase for encrypted private key (optional)
+ */
+
 /**
  * @typedef {Object} HttpServerConfig
  * @property {string}  defaultHost                   - Bind address (default "127.0.0.1")
@@ -8,6 +18,7 @@
  * @property {string}  headerConnectionPrefix        - Lowercase "connection:" for matching
  * @property {string}  headerContentLengthPrefix     - Lowercase "content-length:" for matching
  * @property {string}  headerTransferEncodingPrefix  - Lowercase "transfer-encoding:" for matching
+ * @property {TlsConfig|null} tls                    - TLS/SSL configuration (null = plain HTTP)
  */
 
 /** @type {HttpServerConfig} */
@@ -20,7 +31,45 @@ const httpServerConfig = {
   headerConnectionPrefix: "connection:",
   headerContentLengthPrefix: "content-length:",
   headerTransferEncodingPrefix: "transfer-encoding:",
+  tls: null,
 };
+
+/**
+ * Resolve a PEM value: if it looks like a file path, read it; otherwise return as-is.
+ * @param {string} value - PEM string or file path
+ * @returns {string} PEM content
+ */
+function resolvePem(value) {
+  if (!value) return null;
+  if (value.includes("-----BEGIN ")) return value;
+  try {
+    return readFileSync(value, "utf8");
+  } catch (err) {
+    throw new Error(`Failed to read TLS file: ${value} (${err.message})`);
+  }
+}
+
+/**
+ * Normalize TLS config — resolve file paths to PEM content and validate.
+ * @param {TlsConfig|null} tls
+ * @returns {{ cert: string, key: string, ca: string|null, passphrase: string|null }|null}
+ */
+function normalizeTlsConfig(tls) {
+  if (!tls) return null;
+
+  const cert = resolvePem(tls.cert);
+  const key = resolvePem(tls.key);
+
+  if (!cert) throw new Error("tls.cert is required — provide a PEM string or file path");
+  if (!key) throw new Error("tls.key is required — provide a PEM string or file path");
+
+  return {
+    cert,
+    key,
+    ca: tls.ca ? resolvePem(tls.ca) : null,
+    passphrase: tls.passphrase ?? null,
+  };
+}
 
 /**
  * Merge caller-provided overrides with built-in defaults, coercing
@@ -46,6 +95,7 @@ export function normalizeHttpServerConfig(overrides = {}) {
       overrides.headerTransferEncodingPrefix ??
         httpServerConfig.headerTransferEncodingPrefix,
     ),
+    tls: normalizeTlsConfig(overrides.tls ?? httpServerConfig.tls),
   };
 }
 

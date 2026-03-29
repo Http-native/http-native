@@ -20,6 +20,7 @@ import defaultHttpServerConfig, {
 } from "./http-server.config.js";
 import { buildRouteEntry } from "./opt/entry.js";
 import { createRouteDevCommentWriter } from "./dev/comments.js";
+import { createHotReloadController } from "./dev/hot-reload.js";
 import { createRuntimeOptimizer } from "./opt/runtime.js";
 
 const HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"];
@@ -888,9 +889,21 @@ function normalizeListenOptions(options = {}) {
     notify: optionOpt?.notify ?? true,
     notifyIntervalMs: optionOpt?.notifyIntervalMs,
     cache: optionOpt?.cache,
+    hotReload:
+      optionOpt?.hotReload === true ||
+      process.env.HTTP_NATIVE_HOT_RELOAD === "1",
+    hotReloadPaths: Array.isArray(optionOpt?.hotReloadPaths)
+      ? optionOpt.hotReloadPaths
+      : undefined,
+    hotReloadDebounceMs: optionOpt?.hotReloadDebounceMs,
     devComments:
       optionOpt?.devComments ?? process.env.HTTP_NATIVE_DEV_COMMENTS !== "0",
   };
+
+  if (normalizedOpt.hotReload) {
+    // Avoid auto-generated source edits causing restart loops in dev hot-reload mode.
+    normalizedOpt.devComments = false;
+  }
 
   return {
     host: options.host ?? serverConfig.defaultHost,
@@ -901,6 +914,7 @@ function normalizeListenOptions(options = {}) {
         : Number(options.backlog),
     opt: normalizedOpt,
     serverConfig,
+    tls: serverConfig.tls ?? null,
   };
 }
 
@@ -977,6 +991,36 @@ export function createApp() {
       return this.onError(handler);
     },
 
+    status(code) {
+      const methods = {};
+      for (const method of [...HTTP_METHODS, "all"]) {
+        const key = method.toLowerCase();
+        methods[key] = (path, handler) => {
+          return this[key](path, async (req, res) => {
+            res.status(code);
+            await handler(req, res);
+          });
+        };
+      }
+      return methods;
+    },
+
+    404(handler) {
+      return this.onError(async (error, req, res) => {
+        if (error?.status === 404 || error?.code === "NOT_FOUND") {
+          await handler(req, res);
+        }
+      });
+    },
+
+    401(handler) {
+      return this.onError(async (error, req, res) => {
+        if (error?.status === 401 || error?.code === "UNAUTHORIZED") {
+          await handler(req, res);
+        }
+      });
+    },
+
     group(pathPrefix, registerGroup) {
       if (typeof registerGroup !== "function") {
         throw new TypeError("group(path, callback) requires a callback function");
@@ -1006,6 +1050,21 @@ export function createApp() {
     listen(options = {}) {
       const startServer = async (listenOptions = options) => {
         const normalizedOptions = normalizeListenOptions(listenOptions);
+
+        await new Promise((resolve, reject) => {
+          import("node:net").then(({ createServer }) => {
+            const tester = createServer();
+            tester.once("error", (err) => {
+              if (err.code === "EADDRINUSE") {
+                reject(new Error(`Port ${normalizedOptions.port} is already in use`));
+              } else {
+                reject(err);
+              }
+            });
+            tester.once("listening", () => tester.close(resolve));
+            tester.listen(normalizedOptions.port, normalizedOptions.host);
+          });
+        });
         const compiledMiddlewares = this._middlewares.map(compileMiddlewareRegistration);
         const errorHandlerPlans = this._errorHandlers.map((handler) =>
           analyzeRequestAccess(Function.prototype.toString.call(handler)),
@@ -1069,6 +1128,15 @@ export function createApp() {
           })),
         };
 
+        if (normalizedOptions.tls) {
+          manifest.tls = {
+            cert: normalizedOptions.tls.cert,
+            key: normalizedOptions.tls.key,
+            ca: normalizedOptions.tls.ca,
+            passphrase: normalizedOptions.tls.passphrase,
+          };
+        }
+
         // Detect session middleware and add config to manifest
         const sessionMiddleware = this._middlewares.find((mw) => mw.handler._sessionConfig);
         if (sessionMiddleware) {
@@ -1099,9 +1167,11 @@ export function createApp() {
           for (const route of compiledRoutes) {
             const routeEntry = buildRouteEntry(route, compiledMiddlewares);
             const baseStatus =
-              routeEntry.staticFastPath === true
-                ? "static-fast-path"
-                : "bridge-dispatch";
+              routeEntry.nativeCache === true
+                ? "native-cache"
+                : routeEntry.staticFastPath === true
+                  ? "static-fast-path"
+                  : "bridge-dispatch";
             devRouteCommentWriter.markRoute(route, baseStatus);
 
             if (route.runtimeResponseCache) {
@@ -1116,17 +1186,45 @@ export function createApp() {
           this._errorHandlers,
           devRouteCommentWriter,
         );
+        // Hot reload: override port/host if the hot reloader is active
+        const hotCtx = globalThis.__HTTP_NATIVE_HOT__;
+        const listenHost = hotCtx?.host ?? normalizedOptions.host;
+        const listenPort = hotCtx?.port ?? normalizedOptions.port;
+
         const handle = native.startServer(JSON.stringify(manifest), dispatcher, {
-          host: normalizedOptions.host,
-          port: normalizedOptions.port,
+          host: listenHost,
+          port: listenPort,
           backlog: normalizedOptions.backlog,
         });
         ACTIVE_NATIVE_SERVERS.add(handle);
 
-        return {
+        let closing = false;
+        const closeServerHandle = async () => {
+          if (closing) {
+            return;
+          }
+          closing = true;
+          ACTIVE_NATIVE_SERVERS.delete(handle);
+          runtimeOptimizer?.dispose?.();
+          devRouteCommentWriter?.cleanup?.();
+          detachDevCommentProcessCleanup();
+          await Promise.resolve(handle.close());
+        };
+
+        const hotReloadController = createHotReloadController({
+          enabled: normalizedOptions.opt.hotReload === true,
+          roots: normalizedOptions.opt.hotReloadPaths,
+          debounceMs: normalizedOptions.opt.hotReloadDebounceMs,
+          beforeRestart: async () => {
+            await closeServerHandle();
+          },
+        });
+
+        const serverHandle = {
           host: handle.host,
           port: handle.port,
-          url: handle.url,
+          url: normalizedOptions.tls ? handle.url.replace("http://", "https://") : handle.url,
+          tls: !!normalizedOptions.tls,
           _handle: handle,
           optimizations: {
             snapshot() {
@@ -1137,28 +1235,33 @@ export function createApp() {
             },
           },
           close() {
-            ACTIVE_NATIVE_SERVERS.delete(handle);
-            runtimeOptimizer?.dispose?.();
-            devRouteCommentWriter?.cleanup?.();
-            detachDevCommentProcessCleanup();
-            return handle.close();
+            hotReloadController?.dispose?.();
+            return closeServerHandle();
           },
         };
+
+        // Hot reload: capture the server handle so hot.js can manage it
+        if (hotCtx) {
+          hotCtx.server = serverHandle;
+        }
+
+        return serverHandle;
       };
 
       let selectedPort = options.port;
       let selectedOpt = options.opt;
+      let selectedTls = options.serverConfig?.tls ?? null;
       let startPromise = null;
 
       const resolveOptions = () => {
-        if (selectedPort === undefined && selectedOpt === undefined) {
-          return options;
-        }
-
         return {
           ...options,
           ...(selectedPort === undefined ? {} : { port: selectedPort }),
           opt: selectedOpt,
+          serverConfig: {
+            ...(options.serverConfig ?? {}),
+            tls: selectedTls,
+          },
         };
       };
 
@@ -1191,6 +1294,52 @@ export function createApp() {
             ...safeOptOptions,
           };
 
+          return chainableListen;
+        },
+        hot(hotOptions = true) {
+          if (startPromise) {
+            return startPromise;
+          }
+
+          const nextOpt = {
+            ...(selectedOpt ?? {}),
+          };
+
+          if (hotOptions === false) {
+            nextOpt.hotReload = false;
+            selectedOpt = nextOpt;
+            return chainableListen;
+          }
+
+          nextOpt.hotReload = true;
+
+          if (hotOptions && typeof hotOptions === "object") {
+            const hotReloadPaths = Array.isArray(hotOptions.paths)
+              ? hotOptions.paths
+              : Array.isArray(hotOptions.hotReloadPaths)
+                ? hotOptions.hotReloadPaths
+                : undefined;
+
+            if (hotReloadPaths) {
+              nextOpt.hotReloadPaths = hotReloadPaths;
+            }
+
+            const hotReloadDebounceMs =
+              hotOptions.debounceMs ?? hotOptions.hotReloadDebounceMs;
+            if (hotReloadDebounceMs !== undefined) {
+              nextOpt.hotReloadDebounceMs = hotReloadDebounceMs;
+            }
+          }
+
+          selectedOpt = nextOpt;
+          return chainableListen;
+        },
+        tls(tlsConfig) {
+          if (startPromise) {
+            return startPromise;
+          }
+
+          selectedTls = tlsConfig;
           return chainableListen;
         },
         then(onFulfilled, onRejected) {
