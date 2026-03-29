@@ -27,6 +27,7 @@ app.get("/", async (req, res) => {
     });
 });
 
+
 app.get("/stable", async (req, res) => {
     
     res.json({

@@ -412,6 +412,8 @@ function isPromiseLike(value) {
 function createDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) {
   const routesById = new Map(compiledRoutes.map((route) => [route.handlerId, route]));
   const errorRequestFactory = createRequestFactory(ERROR_REQUEST_PLAN, [], null);
+  const trackDispatchTiming =
+    runtimeOptimizer?.shouldCaptureDispatchTiming?.() === true;
 
   async function finalizeError(error, req, res, snapshot, release, fallbackStatus = 500) {
     try {
@@ -476,6 +478,7 @@ function createDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) 
 
     const req = route.requestFactory(decoded);
     const { response: res, snapshot, release } = createResponseEnvelope(route.jsonSerializer);
+    const dispatchStartMs = trackDispatchTiming ? performance.now() : 0;
 
     try {
       const middlewareResult = route.runMiddlewares(req, res);
@@ -495,7 +498,10 @@ function createDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) 
     }
 
     const responseSnapshot = snapshot();
-    runtimeOptimizer?.recordDispatch(route, req, responseSnapshot);
+    const dispatchDurationMs = trackDispatchTiming
+      ? performance.now() - dispatchStartMs
+      : undefined;
+    runtimeOptimizer?.recordDispatch(route, req, responseSnapshot, dispatchDurationMs);
     const encoded = encodeResponseEnvelope(responseSnapshot);
     maybePromoteRouteResponseCache(route, responseSnapshot, encoded);
     releaseRequestObject(req);

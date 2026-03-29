@@ -127,7 +127,7 @@ function printRouteCatalog(routeEntries) {
     return;
   }
 
-  log("info", "tracking routes:");
+  log("info", "Route information / Tracking:");
   for (const entry of routeEntries) {
     log("debug", `${ANSI.magenta}${entry.label}${ANSI.reset} staticFastPath=${entry.staticFastPath} dispatch=${entry.dispatchKind}`);
   }
@@ -140,11 +140,27 @@ function printLiveRouteHits(routeEntries) {
     return;
   }
 
-  log("info", "live hits:");
-  for (const entry of active) {
+  // this is not needed just makes things ugly
+  //log("info", "Router & Routes:");
+  for (const entry of active.sort((a, b) => b.hits - a.hits)) {
+    const intervalHits = entry.hits - entry.lastIntervalHits;
+    const intervalDurationMs = entry.totalDurationMs - entry.lastIntervalDurationMs;
+    const avgMs = entry.hits > 0 ? entry.totalDurationMs / entry.hits : 0;
+    const intervalAvgMs =
+      intervalHits > 0 ? intervalDurationMs / intervalHits : 0;
+
     log(
       "success",
-      `${ANSI.magenta}${entry.label}${ANSI.reset} ${ANSI.green}hits=${entry.hits}${ANSI.reset} stage=${entry.stage} bridgeObserved=${entry.bridgeObserved}`,
+      `${ANSI.magenta}${entry.label}${ANSI.reset} total=${entry.hits} +${intervalHits} avg=${formatMs(avgMs)} last=${formatMs(entry.lastDurationMs)} max=${formatMs(entry.maxDurationMs)} intervalAvg=${formatMs(intervalAvgMs)}`,
     );
+    entry.lastIntervalHits = entry.hits;
+    entry.lastIntervalDurationMs = entry.totalDurationMs;
   }
+}
+
+function formatMs(value) {
+  if (!Number.isFinite(value) || value <= 0) {
+    return "0.00ms";
+  }
+  return `${value.toFixed(2)}ms`;
 }

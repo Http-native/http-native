@@ -104,6 +104,8 @@ export interface RuntimeOptimizationOptions {
   notify?: boolean;
   /** Live notify interval in milliseconds (default: 1000) */
   notifyIntervalMs?: number;
+  /** Collect per-route dispatch timing metrics */
+  timing?: boolean;
   /** Enable runtime response cache promotion for deterministic routes */
   cache?: boolean;
 }
@@ -161,6 +163,9 @@ export interface RouteOptimizationInfo {
   bridgeObserved: boolean;
   cacheCandidate: boolean;
   hits: number;
+  avgDurationMs?: number;
+  lastDurationMs?: number;
+  maxDurationMs?: number;
   recommendation?: string;
   dispatchKind?: string;
   jsonFastPath?: string;
