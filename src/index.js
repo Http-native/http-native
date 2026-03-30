@@ -1083,9 +1083,38 @@ async function closeNativeServerHandle(handle, timeoutMs = NATIVE_CLOSE_TIMEOUT_
  *
  * @returns {import('./index').Application}
  */
-export function createApp() {
+export function createApp(config = {}) {
   const native = loadNativeModule();
   let nextHandlerId = 1;
+
+  // Consolidate top-level config into a normalized shape that listen() can use as defaults.
+  const appConfig = {
+    server: config.server ?? {},
+    tls: config.tls ?? null,
+    dev: config.dev ?? {},
+  };
+
+  // Build default listen options from createApp config so listen() inherits them.
+  const appListenDefaults = {
+    host: appConfig.server.host,
+    port: appConfig.server.port,
+    backlog: appConfig.server.backlog,
+    serverConfig: {
+      ...(appConfig.server.maxHeaderBytes !== undefined
+        ? { maxHeaderBytes: appConfig.server.maxHeaderBytes }
+        : {}),
+      tls: appConfig.tls,
+    },
+    opt: {
+      ...(appConfig.dev.hotReload !== undefined ? { hotReload: appConfig.dev.hotReload } : {}),
+      ...(appConfig.dev.hotReloadPaths !== undefined ? { hotReloadPaths: appConfig.dev.hotReloadPaths } : {}),
+      ...(appConfig.dev.hotReloadDebounceMs !== undefined ? { hotReloadDebounceMs: appConfig.dev.hotReloadDebounceMs } : {}),
+      ...(appConfig.dev.devComments !== undefined ? { devComments: appConfig.dev.devComments } : {}),
+      ...(appConfig.dev.notify !== undefined ? { notify: appConfig.dev.notify } : {}),
+      ...(appConfig.dev.timing !== undefined ? { timing: appConfig.dev.timing } : {}),
+      ...(appConfig.dev.cache !== undefined ? { cache: appConfig.dev.cache } : {}),
+    },
+  };
 
   const app = {
     _routes: [],
@@ -1093,6 +1122,7 @@ export function createApp() {
     _errorHandlers: [],
     _wsRoutes: [],
     _groupPrefix: "/",
+    _config: appConfig,
 
     use(pathOrMiddleware, maybeMiddleware) {
       let pathPrefix = "/";
@@ -1185,7 +1215,22 @@ export function createApp() {
 
     listen(options = {}) {
       const startServer = async (listenOptions = options) => {
-        const normalizedOptions = normalizeListenOptions(listenOptions);
+        // Merge app-level defaults (from createApp config) with per-listen overrides.
+        const mergedOptions = {
+          host: listenOptions.host ?? appListenDefaults.host,
+          port: listenOptions.port ?? appListenDefaults.port,
+          backlog: listenOptions.backlog ?? appListenDefaults.backlog,
+          serverConfig: {
+            ...(appListenDefaults.serverConfig ?? {}),
+            ...(listenOptions.serverConfig ?? {}),
+            tls: listenOptions.serverConfig?.tls ?? appListenDefaults.serverConfig?.tls,
+          },
+          opt: {
+            ...(appListenDefaults.opt ?? {}),
+            ...(listenOptions.opt ?? {}),
+          },
+        };
+        const normalizedOptions = normalizeListenOptions(mergedOptions);
 
         await new Promise((resolve, reject) => {
           import("node:net").then(({ createServer }) => {

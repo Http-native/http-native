@@ -269,6 +269,43 @@ export interface RouteOptimizationInfo {
   jsonFastPath?: string;
 }
 
+// ─── App Configuration ─────────────────
+
+export interface AppConfig {
+  /** Server configuration (host, port, backlog, maxHeaderBytes) */
+  server?: {
+    /** Host to bind to (default: "127.0.0.1") */
+    host?: string;
+    /** Port to bind to (default: 3000, use 0 for random) */
+    port?: number;
+    /** TCP listen backlog (default: 2048) */
+    backlog?: number;
+    /** Maximum header block size in bytes */
+    maxHeaderBytes?: number;
+  };
+
+  /** TLS/SSL configuration — set to enable HTTPS */
+  tls?: TlsConfig | null;
+
+  /** Development and optimization options */
+  dev?: {
+    /** Restart process on source changes (dev only, default: false) */
+    hotReload?: boolean;
+    /** Watch roots for hot reload */
+    hotReloadPaths?: string[];
+    /** Debounce window for restart triggers in ms (default: 120) */
+    hotReloadDebounceMs?: number;
+    /** Write dev comments above route declarations (default: true) */
+    devComments?: boolean;
+    /** Emit optimization and live-hit logs */
+    notify?: boolean;
+    /** Collect per-route dispatch timing metrics */
+    timing?: boolean;
+    /** Enable runtime response cache promotion */
+    cache?: boolean;
+  };
+}
+
 // ─── Application ────────────────────────
 
 export interface Application {
@@ -314,7 +351,7 @@ export interface Application {
 }
 
 /** Create a new http-native application */
-export function createApp(): Application;
+export function createApp(config?: AppConfig): Application;
 
 // ─── CORS Types ─────────────────────────
 
