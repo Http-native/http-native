@@ -4,6 +4,8 @@ import path from "node:path";
 
 const DEFAULT_WATCH_ROOTS = ["src", "rsrc/src", ".github/tests"];
 const DEFAULT_DEBOUNCE_MS = 120;
+const DEFAULT_STARTUP_IGNORE_MS = 250;
+const DEFAULT_PRE_RESTART_TIMEOUT_MS = 2500;
 const WATCHED_EXTENSIONS = new Set([
   ".js",
   ".mjs",
@@ -32,8 +34,17 @@ export function createHotReloadController(options = {}) {
 
   const roots = normalizeWatchRoots(options.roots);
   const debounceMs = normalizeDebounceMs(options.debounceMs);
+  const startupIgnoreMs = normalizeDelayMs(
+    options.startupIgnoreMs,
+    DEFAULT_STARTUP_IGNORE_MS,
+  );
+  const beforeRestartTimeoutMs = normalizeDelayMs(
+    options.beforeRestartTimeoutMs,
+    DEFAULT_PRE_RESTART_TIMEOUT_MS,
+  );
   const log = options.log ?? ((message) => console.log(message));
   const beforeRestart = options.beforeRestart ?? (async () => {});
+  const watchReadyAt = Date.now() + startupIgnoreMs;
 
   const watchers = [];
   let restartTimer = null;
@@ -51,6 +62,9 @@ export function createHotReloadController(options = {}) {
         { recursive: true },
         (_eventType, filename) => {
           if (restarting) {
+            return;
+          }
+          if (Date.now() < watchReadyAt) {
             return;
           }
           const changedFile = filename
@@ -84,7 +98,7 @@ export function createHotReloadController(options = {}) {
   }
 
   log(
-    `[http-native][hot-reload] enabled (${watchers.length} roots, debounce=${debounceMs}ms)`,
+    `[http-native][hot-reload] enabled (${watchers.length} roots, debounce=${debounceMs}ms, cleanupTimeout=${beforeRestartTimeoutMs}ms)`,
   );
 
   async function restartProcess() {
@@ -98,24 +112,27 @@ export function createHotReloadController(options = {}) {
     log(`[http-native][hot-reload] change detected: ${changedFile}`);
     log("[http-native][hot-reload] restarting process...");
 
-    try {
-      await beforeRestart(changedFile);
-    } catch (error) {
-      log(`[http-native][hot-reload] pre-restart cleanup failed: ${error.message}`);
-    }
+    await runBeforeRestart(beforeRestart, changedFile, beforeRestartTimeoutMs, log);
 
     const argv = process.argv.slice(1);
-    const child = spawn(process.execPath, argv, {
-      cwd: process.cwd(),
-      env: { ...process.env, HTTP_NATIVE_HOT_RELOAD: "1" },
-      stdio: "inherit",
-    });
-
-    child.on("error", (error) => {
+    let child = null;
+    try {
+      child = spawn(process.execPath, argv, {
+        cwd: process.cwd(),
+        env: { ...process.env, HTTP_NATIVE_HOT_RELOAD: "1" },
+        stdio: "inherit",
+      });
+      child.on("error", (error) => {
+        log(`[http-native][hot-reload] failed to respawn: ${error.message}`);
+      });
+      if (typeof child.unref === "function") {
+        child.unref();
+      }
+    } catch (error) {
       log(`[http-native][hot-reload] failed to respawn: ${error.message}`);
-    });
+    }
 
-    process.exit(0);
+    process.exit(child ? 0 : 1);
   }
 
   function stopWatching() {
@@ -156,6 +173,14 @@ function normalizeDebounceMs(value) {
   return Math.floor(normalized);
 }
 
+function normalizeDelayMs(value, fallback) {
+  const normalized = Number(value);
+  if (!Number.isFinite(normalized) || normalized < 0) {
+    return fallback;
+  }
+  return Math.floor(normalized);
+}
+
 function shouldWatchFile(filePath) {
   const normalizedPath = filePath.replaceAll("\\", "/");
   for (const segment of IGNORED_SEGMENTS) {
@@ -166,4 +191,36 @@ function shouldWatchFile(filePath) {
 
   const extension = path.extname(filePath).toLowerCase();
   return WATCHED_EXTENSIONS.has(extension);
+}
+
+async function runBeforeRestart(beforeRestart, changedFile, timeoutMs, log) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    try {
+      await Promise.resolve(beforeRestart(changedFile));
+    } catch (error) {
+      log(`[http-native][hot-reload] pre-restart cleanup failed: ${error.message}`);
+    }
+    return;
+  }
+
+  let timeoutId = null;
+  try {
+    await Promise.race([
+      Promise.resolve(beforeRestart(changedFile)),
+      new Promise((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(new Error(`timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+        if (typeof timeoutId.unref === "function") {
+          timeoutId.unref();
+        }
+      }),
+    ]);
+  } catch (error) {
+    log(`[http-native][hot-reload] pre-restart cleanup failed: ${error.message}`);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
 }

@@ -15,14 +15,17 @@ const STATUS_DESCRIPTIONS = {
 };
 
 export function createRouteDevCommentWriter(options = {}) {
-  if (options?.devComments !== true) {
+  if (
+    options?.devComments !== true ||
+    options?.hotReload === true ||
+    process.env.HTTP_NATIVE_HOT_RELOAD === "1"
+  ) {
     return null;
   }
 
   const applied = new Set();
   const initializedRoutes = new Set();
   const fileState = new Map();
-  const touchedFiles = new Set();
 
   return {
     markRoute(route, status) {
@@ -41,7 +44,6 @@ export function createRouteDevCommentWriter(options = {}) {
         return;
       }
       applied.add(dedupeKey);
-      touchedFiles.add(sourceLocation.filePath);
 
       const routeKey = `${sourceLocation.filePath}:${sourceLocation.line}`;
       const replaceExisting = initializedRoutes.has(routeKey) === false;
@@ -57,94 +59,40 @@ export function createRouteDevCommentWriter(options = {}) {
     },
 
     cleanup() {
-      for (const filePath of touchedFiles) {
-        removeGeneratedOptimizationComments(filePath);
+      for (const [filePath, state] of fileState) {
+        cleanupFile(filePath, state);
       }
     },
   };
 }
 
-function removeGeneratedOptimizationComments(filePath) {
-  let fileText;
-  try {
-    fileText = readFileSync(filePath, "utf8");
-  } catch {
+function cleanupFile(filePath, state) {
+  if (linesEqual(state.lines, state.baseLines)) {
     return;
   }
 
-  const eol = fileText.includes("\r\n") ? "\r\n" : "\n";
-  const lines = fileText.split(/\r?\n/);
-  const output = [];
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    const trimmed = line.trim();
-
-    if (trimmed.startsWith("//") && trimmed.includes(COMMENT_PREFIX)) {
-      continue;
-    }
-
-    if (trimmed === "/**") {
-      let endIndex = index;
-      while (endIndex < lines.length && lines[endIndex].trim() !== "*/") {
-        endIndex += 1;
-      }
-      if (endIndex < lines.length) {
-        const blockLines = lines.slice(index, endIndex + 1);
-        const isOptimizationBlock = blockLines.some((entry) => entry.includes(COMMENT_PREFIX));
-        if (isOptimizationBlock) {
-          index = endIndex;
-          continue;
-        }
-      }
-    }
-
-    output.push(line);
-  }
-
-  const compacted = compactExtraBlankLines(output);
-  if (compacted.join(eol) !== lines.join(eol)) {
-    persist(filePath, compacted, eol);
-  }
+  state.lines = [...state.baseLines];
+  persistState(filePath, state);
 }
 
-function compactExtraBlankLines(lines) {
-  const result = [];
-  let previousBlank = false;
-
-  for (const line of lines) {
-    const isBlank = line.trim() === "";
-    if (isBlank && previousBlank) {
-      continue;
-    }
-    result.push(line);
-    previousBlank = isBlank;
-  }
-
-  return result;
-}
-
-function annotateFile(fileState, filePath, originalLine, status, options = {}) {
-  let fileText;
-  try {
-    fileText = readFileSync(filePath, "utf8");
-  } catch {
-    return;
-  }
-
-  const eol = fileText.includes("\r\n") ? "\r\n" : "\n";
-  const lines = fileText.split(/\r?\n/);
+function annotateFile(fileState, filePath, sourceLine, status, options = {}) {
   const state = getFileState(fileState, filePath);
-
-  const effectiveLine = originalLine + countInsertedBefore(state.insertedAtOriginalLine, originalLine);
-  const targetIndex = effectiveLine - 1;
-  if (targetIndex < 0 || targetIndex >= lines.length) {
+  if (!state) {
     return;
   }
 
-  const routeLine = lines[targetIndex] ?? "";
+  const normalizedLine = normalizeSourceLine(state, sourceLine);
+
+  const effectiveLine =
+    normalizedLine + countInsertedBefore(state.insertedAtOriginalLine, normalizedLine);
+  const targetIndex = effectiveLine - 1;
+  if (targetIndex < 0 || targetIndex >= state.lines.length) {
+    return;
+  }
+
+  const routeLine = state.lines[targetIndex] ?? "";
   const indent = routeLine.match(/^\s*/)?.[0] ?? "";
-  const existingBlock = findExistingOptimizationBlock(lines, targetIndex, indent);
+  const existingBlock = findExistingOptimizationBlock(state.lines, targetIndex, indent);
   const replaceExisting = options.replaceExisting === true;
 
   if (existingBlock) {
@@ -152,34 +100,34 @@ function annotateFile(fileState, filePath, originalLine, status, options = {}) {
       ? [status]
       : mergeStatuses(existingBlock.statuses, status);
     const replacement = buildOptimizationBlock(indent, mergedStatuses);
-    lines.splice(
+    state.lines.splice(
       existingBlock.startIndex,
       existingBlock.endIndex - existingBlock.startIndex + 1,
       ...replacement,
     );
-    persist(filePath, lines, eol);
+    persistState(filePath, state);
     return;
   }
 
   const singleLineIndex = targetIndex - 1;
-  const singleLineStatuses = parseSingleLineComment(lines[singleLineIndex], indent);
+  const singleLineStatuses = parseSingleLineComment(state.lines[singleLineIndex], indent);
   if (singleLineStatuses) {
     const mergedStatuses = replaceExisting
       ? [status]
       : mergeStatuses(singleLineStatuses, status);
     const replacement = buildOptimizationBlock(indent, mergedStatuses);
-    lines.splice(singleLineIndex, 1, ...replacement);
-    state.insertedAtOriginalLine.push({ line: originalLine, count: replacement.length - 1 });
+    state.lines.splice(singleLineIndex, 1, ...replacement);
+    state.insertedAtOriginalLine.push({ line: normalizedLine, count: replacement.length - 1 });
     state.insertedAtOriginalLine.sort((left, right) => left.line - right.line);
-    persist(filePath, lines, eol);
+    persistState(filePath, state);
     return;
   }
 
   const block = buildOptimizationBlock(indent, [status]);
-  lines.splice(targetIndex, 0, ...block);
-  state.insertedAtOriginalLine.push({ line: originalLine, count: block.length });
+  state.lines.splice(targetIndex, 0, ...block);
+  state.insertedAtOriginalLine.push({ line: normalizedLine, count: block.length });
   state.insertedAtOriginalLine.sort((left, right) => left.line - right.line);
-  persist(filePath, lines, eol);
+  persistState(filePath, state);
 }
 
 function findExistingOptimizationBlock(lines, targetIndex, indent) {
@@ -195,7 +143,7 @@ function findExistingOptimizationBlock(lines, targetIndex, indent) {
 
   const endIndex = cursor;
   let startIndex = endIndex;
-  while (startIndex >= 0 && lines[startIndex].trim() !== "/**") {
+  while (startIndex >= 0 && !lines[startIndex].trim().startsWith("/**")) {
     startIndex -= 1;
   }
 
@@ -281,12 +229,39 @@ function persist(filePath, lines, eol) {
 
 function getFileState(fileState, filePath) {
   if (!fileState.has(filePath)) {
+    let fileText;
+    try {
+      fileText = readFileSync(filePath, "utf8");
+    } catch {
+      return null;
+    }
+
+    const eol = fileText.includes("\r\n") ? "\r\n" : "\n";
+    const lines = fileText.split(/\r?\n/);
+    const cleaned = stripGeneratedOptimizationComments(lines);
+
     fileState.set(filePath, {
+      eol,
+      lines: [...cleaned.lines],
+      baseLines: [...cleaned.lines],
+      removedBeforeLine: cleaned.removedBeforeLine,
       insertedAtOriginalLine: [],
     });
+
+    if (!linesEqual(lines, cleaned.lines)) {
+      persist(filePath, cleaned.lines, eol);
+    }
   }
 
   return fileState.get(filePath);
+}
+
+function normalizeSourceLine(state, sourceLine) {
+  const numeric = Number(sourceLine);
+  const normalized = Number.isFinite(numeric) ? Math.max(1, Math.floor(numeric)) : 1;
+  const lookupIndex = Math.min(normalized, state.removedBeforeLine.length - 1);
+  const removed = state.removedBeforeLine[lookupIndex] ?? 0;
+  return Math.max(1, normalized - removed);
 }
 
 function countInsertedBefore(insertedAtOriginalLine, originalLine) {
@@ -297,4 +272,64 @@ function countInsertedBefore(insertedAtOriginalLine, originalLine) {
     }
   }
   return count;
+}
+
+function stripGeneratedOptimizationComments(lines) {
+  const output = [];
+  const removedBeforeLine = new Array(lines.length + 1).fill(0);
+  let removedCount = 0;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmed = line.trim();
+
+    if (trimmed.startsWith("//") && trimmed.includes(COMMENT_PREFIX)) {
+      removedCount += 1;
+      removedBeforeLine[index + 1] = removedCount;
+      continue;
+    }
+
+    if (trimmed.startsWith("/**")) {
+      let endIndex = index;
+      while (endIndex < lines.length && lines[endIndex].trim() !== "*/") {
+        endIndex += 1;
+      }
+      if (endIndex < lines.length) {
+        const blockLines = lines.slice(index, endIndex + 1);
+        const isOptimizationBlock = blockLines.some((entry) => entry.includes(COMMENT_PREFIX));
+        if (isOptimizationBlock) {
+          for (let cursor = index; cursor <= endIndex; cursor += 1) {
+            removedCount += 1;
+            removedBeforeLine[cursor + 1] = removedCount;
+          }
+          index = endIndex;
+          continue;
+        }
+      }
+    }
+
+    output.push(line);
+    removedBeforeLine[index + 1] = removedCount;
+  }
+
+  return {
+    lines: output,
+    removedBeforeLine,
+  };
+}
+
+function persistState(filePath, state) {
+  persist(filePath, state.lines, state.eol);
+}
+
+function linesEqual(left, right) {
+  if (left.length !== right.length) {
+    return false;
+  }
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) {
+      return false;
+    }
+  }
+  return true;
 }
