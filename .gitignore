@@ -14,3 +14,6 @@ zig-httpz
 .github/bench/results/
 testing/
 bench
+examples/
+plan/
+plans/
