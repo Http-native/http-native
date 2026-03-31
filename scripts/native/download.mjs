@@ -82,6 +82,14 @@ export async function downloadNativeBinary(options = {}) {
     rmSync(tempPath, { force: true });
     const message =
       error instanceof Error ? error.message : "unknown download failure";
+    const missingReleaseAsset =
+      message.includes("download failed (404") &&
+      downloadUrl.includes("/releases/download/");
+    if (missingReleaseAsset) {
+      throw new Error(
+        `Release asset not found for ${tag} (${assetName}). Publish workflow must create release binaries before npm publish.`,
+      );
+    }
     throw new Error(
       `Unable to setup native binary for ${platform}-${arch}. ${message}`,
     );

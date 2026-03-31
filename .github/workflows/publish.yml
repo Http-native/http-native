@@ -1,23 +1,89 @@
 name: Release
 
 on:
-  release:
-    types: [created]
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Release tag (for example v0.0.7)"
-        required: false
-        default: ""
       publish_npm:
         description: "Publish @http-native/core to npm"
         required: false
-        default: "false"
+        default: "true"
 
 jobs:
+  prepare-version:
+    name: prepare-version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      tag: ${{ steps.bump.outputs.tag }}
+      commit_sha: ${{ steps.commit.outputs.commit_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - id: bump
+        name: Bump patch version
+        run: |
+          bun -e '
+            import { readFileSync, writeFileSync, appendFileSync } from "node:fs";
+            const packageJsonPath = "package.json";
+            const pkg = JSON.parse(readFileSync(packageJsonPath, "utf8"));
+            const parts = String(pkg.version ?? "").split(".");
+            if (parts.length !== 3) {
+              throw new Error(`Expected semver version x.y.z, got "${pkg.version}"`);
+            }
+            const major = Number(parts[0]);
+            const minor = Number(parts[1]);
+            const patch = Number(parts[2]);
+            if (![major, minor, patch].every(Number.isInteger)) {
+              throw new Error(`Invalid numeric semver version "${pkg.version}"`);
+            }
+            const nextVersion = `${major}.${minor}.${patch + 1}`;
+            pkg.version = nextVersion;
+            writeFileSync(packageJsonPath, `${JSON.stringify(pkg, null, 2)}\n`);
+            appendFileSync(process.env.GITHUB_OUTPUT, `version=${nextVersion}\n`);
+            appendFileSync(process.env.GITHUB_OUTPUT, `tag=v${nextVersion}\n`);
+            console.log(`[http-native] publish version ${nextVersion}`);
+          '
+
+      - id: commit
+        name: Commit bumped version
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json
+          git commit -m "chore(release): bump version to ${{ steps.bump.outputs.version }}"
+          git push origin "HEAD:${{ github.ref_name }}"
+          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  create-release:
+    name: create-release
+    runs-on: ubuntu-latest
+    needs: prepare-version
+    permissions:
+      contents: write
+    steps:
+      - name: Create release tag
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare-version.outputs.tag }}
+          name: ${{ needs.prepare-version.outputs.tag }}
+          target_commitish: ${{ needs.prepare-version.outputs.commit_sha }}
+          generate_release_notes: true
+
   native-binaries:
     name: native-${{ matrix.platform }}-${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
+    needs:
+      - prepare-version
+      - create-release
     permissions:
       contents: write
     strategy:
@@ -43,6 +109,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-version.outputs.commit_sha }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -70,16 +138,9 @@ jobs:
           if-no-files-found: error
 
       - name: Resolve release tag
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            echo "RELEASE_TAG=${{ github.event.release.tag_name }}" >> "$GITHUB_ENV"
-          else
-            echo "RELEASE_TAG=${{ inputs.tag }}" >> "$GITHUB_ENV"
-          fi
+        run: echo "RELEASE_TAG=${{ needs.prepare-version.outputs.tag }}" >> "$GITHUB_ENV"
 
-      - name: Upload release asset
-        if: env.RELEASE_TAG != ''
+      - name: Upload release binary
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
@@ -88,12 +149,16 @@ jobs:
   publish-npm:
     name: publish-npm
     runs-on: ubuntu-latest
-    needs: native-binaries
-    if: github.event_name == 'release' || (inputs.publish_npm == 'true' && inputs.tag != '')
+    needs:
+      - prepare-version
+      - native-binaries
+    if: inputs.publish_npm == 'true'
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-version.outputs.commit_sha }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
