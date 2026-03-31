@@ -1,12 +1,20 @@
 name: Benchmark
 
 on:
-  push:
-    branches:
-      - "**"
   pull_request:
     branches:
       - "**"
+    paths:
+      - "src/**/*.js"
+      - "src/**/*.mjs"
+      - "src/**/*.cjs"
+      - "src/**/*.ts"
+      - "src/**/*.tsx"
+      - "rsrc/**/*.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/bench/**"
+      - ".github/workflows/main.yml"
   workflow_dispatch:
     inputs:
       engines:
