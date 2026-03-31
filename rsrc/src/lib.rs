@@ -5,6 +5,7 @@ pub mod session;
 mod websocket;
 
 use anyhow::{anyhow, Context, Result};
+use arc_swap::ArcSwap;
 use memchr::memmem;
 use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
 use monoio::net::{ListenerOpts, TcpListener};
@@ -17,6 +18,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig as RustlsServerConfig;
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::io::BufReader;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
@@ -190,11 +192,17 @@ struct ShutdownHandle {
     wake_addrs: Vec<SocketAddr>,
 }
 
+struct LiveRouter {
+    router: ArcSwap<Router>,
+}
+
 #[napi]
 pub struct NativeServerHandle {
     host: String,
     port: u32,
     url: String,
+    live_router: Arc<LiveRouter>,
+    cache_namespaces: Mutex<HashSet<u64>>,
     shutdown: Mutex<Option<ShutdownHandle>>,
     closed: Mutex<Option<Vec<mpsc::Receiver<()>>>>,
 }
@@ -217,7 +225,41 @@ impl NativeServerHandle {
     }
 
     #[napi]
+    pub fn reload(&self, manifest_json: String) -> napi::Result<()> {
+        let manifest: ManifestInput = serde_json::from_str(&manifest_json).map_err(to_napi_error)?;
+        validate_manifest(&manifest).map_err(to_napi_error)?;
+        let next_router = Arc::new(Router::from_manifest(&manifest).map_err(to_napi_error)?);
+        let next_namespaces = next_router.cache_namespaces();
+
+        {
+            let mut registered = self
+                .cache_namespaces
+                .lock()
+                .expect("cache namespaces mutex poisoned");
+            replace_cache_namespaces(&mut registered, &next_namespaces);
+            *registered = next_namespaces;
+        }
+
+        self.live_router.router.store(next_router);
+        close_all_websocket_connections();
+        Ok(())
+    }
+
+    #[napi]
     pub fn close(&self) -> napi::Result<()> {
+        let registered_namespaces = {
+            let mut namespaces = self
+                .cache_namespaces
+                .lock()
+                .expect("cache namespaces mutex poisoned");
+            let snapshot = namespaces.clone();
+            namespaces.clear();
+            snapshot
+        };
+        unregister_cache_namespaces(&registered_namespaces);
+
+        close_all_websocket_connections();
+
         if let Some(shutdown) = self
             .shutdown
             .lock()
@@ -259,9 +301,83 @@ static GLOBAL_SESSION_STORE: std::sync::OnceLock<Arc<session::SessionStore>> =
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 static STREAM_CHANNELS: std::sync::OnceLock<dashmap::DashMap<u64, flume::Sender<StreamMessage>>> =
     std::sync::OnceLock::new();
+static WEBSOCKET_CONNECTIONS: std::sync::OnceLock<dashmap::DashMap<u64, ()>> =
+    std::sync::OnceLock::new();
+static CACHE_NAMESPACE_COUNTS: std::sync::OnceLock<dashmap::DashMap<u64, usize>> =
+    std::sync::OnceLock::new();
+pub(crate) static CACHE_NAMESPACE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn stream_registry() -> &'static dashmap::DashMap<u64, flume::Sender<StreamMessage>> {
     STREAM_CHANNELS.get_or_init(dashmap::DashMap::new)
+}
+
+fn websocket_connections() -> &'static dashmap::DashMap<u64, ()> {
+    WEBSOCKET_CONNECTIONS.get_or_init(dashmap::DashMap::new)
+}
+
+pub(crate) fn cache_namespace_counts() -> &'static dashmap::DashMap<u64, usize> {
+    CACHE_NAMESPACE_COUNTS.get_or_init(dashmap::DashMap::new)
+}
+
+fn register_cache_namespaces(namespaces: &HashSet<u64>) {
+    if namespaces.is_empty() {
+        return;
+    }
+
+    let counts = cache_namespace_counts();
+    for namespace in namespaces {
+        counts
+            .entry(*namespace)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+    }
+
+    CACHE_NAMESPACE_GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+fn unregister_cache_namespaces(namespaces: &HashSet<u64>) {
+    if namespaces.is_empty() {
+        return;
+    }
+
+    let counts = cache_namespace_counts();
+    for namespace in namespaces {
+        if let Some(mut entry) = counts.get_mut(namespace) {
+            if *entry <= 1 {
+                drop(entry);
+                counts.remove(namespace);
+            } else {
+                *entry -= 1;
+            }
+        }
+    }
+
+    CACHE_NAMESPACE_GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+fn replace_cache_namespaces(previous: &HashSet<u64>, next: &HashSet<u64>) {
+    let removed = previous
+        .difference(next)
+        .copied()
+        .collect::<HashSet<_>>();
+    let added = next
+        .difference(previous)
+        .copied()
+        .collect::<HashSet<_>>();
+
+    unregister_cache_namespaces(&removed);
+    register_cache_namespaces(&added);
+}
+
+fn close_all_websocket_connections() {
+    let websocket_ids = websocket_connections()
+        .iter()
+        .map(|entry| *entry.key())
+        .collect::<Vec<_>>();
+
+    for websocket_id in websocket_ids {
+        let _ = stream_end(websocket_id as i64);
+    }
 }
 
 enum StreamMessage {
@@ -296,6 +412,7 @@ pub fn stream_end(stream_id: i64) -> napi::Result<()> {
     if let Some((_, sender)) = registry.remove(&(stream_id as u64)) {
         let _ = sender.send(StreamMessage::End);
     }
+    websocket_connections().remove(&(stream_id as u64));
     Ok(())
 }
 
@@ -312,12 +429,8 @@ pub fn session_get(session_id_hex: String, key: String) -> Option<String> {
 /// Set a session value. Value should be a JSON string.
 #[napi]
 pub fn session_set(session_id_hex: String, key: String, value: String) -> bool {
-    let Some(store) = GLOBAL_SESSION_STORE.get() else {
-        return false;
-    };
-    let Some(id) = session::hex_decode_id(&session_id_hex) else {
-        return false;
-    };
+    let Some(store) = GLOBAL_SESSION_STORE.get() else { return false };
+    let Some(id) = session::hex_decode_id(&session_id_hex) else { return false };
     let mut mutations = std::collections::HashMap::new();
     mutations.insert(key, value.into_bytes());
     store.upsert(&id, mutations, &[]);
@@ -327,12 +440,8 @@ pub fn session_set(session_id_hex: String, key: String, value: String) -> bool {
 /// Delete a session key.
 #[napi]
 pub fn session_delete(session_id_hex: String, key: String) -> bool {
-    let Some(store) = GLOBAL_SESSION_STORE.get() else {
-        return false;
-    };
-    let Some(id) = session::hex_decode_id(&session_id_hex) else {
-        return false;
-    };
+    let Some(store) = GLOBAL_SESSION_STORE.get() else { return false };
+    let Some(id) = session::hex_decode_id(&session_id_hex) else { return false };
     store.upsert(&id, std::collections::HashMap::new(), &[key]);
     true
 }
@@ -340,12 +449,8 @@ pub fn session_delete(session_id_hex: String, key: String) -> bool {
 /// Destroy an entire session.
 #[napi]
 pub fn session_destroy(session_id_hex: String) -> bool {
-    let Some(store) = GLOBAL_SESSION_STORE.get() else {
-        return false;
-    };
-    let Some(id) = session::hex_decode_id(&session_id_hex) else {
-        return false;
-    };
+    let Some(store) = GLOBAL_SESSION_STORE.get() else { return false };
+    let Some(id) = session::hex_decode_id(&session_id_hex) else { return false };
     store.destroy(&id);
     true
 }
@@ -386,18 +491,10 @@ pub fn session_get_all(session_id_hex: String) -> Option<String> {
 /// Set multiple session values at once. Takes a JSON object string.
 #[napi]
 pub fn session_set_all(session_id_hex: String, data_json: String) -> bool {
-    let Some(store) = GLOBAL_SESSION_STORE.get() else {
-        return false;
-    };
-    let Some(id) = session::hex_decode_id(&session_id_hex) else {
-        return false;
-    };
-    let Ok(obj) = serde_json::from_str::<serde_json::Value>(&data_json) else {
-        return false;
-    };
-    let Some(map) = obj.as_object() else {
-        return false;
-    };
+    let Some(store) = GLOBAL_SESSION_STORE.get() else { return false };
+    let Some(id) = session::hex_decode_id(&session_id_hex) else { return false };
+    let Ok(obj) = serde_json::from_str::<serde_json::Value>(&data_json) else { return false };
+    let Some(map) = obj.as_object() else { return false };
     let mut mutations = std::collections::HashMap::new();
     for (key, value) in map {
         mutations.insert(key.clone(), value.to_string().into_bytes());
@@ -417,6 +514,11 @@ pub fn start_server(
     let server_config =
         Arc::new(HttpServerConfig::from_manifest(&manifest).map_err(to_napi_error)?);
     let router = Arc::new(Router::from_manifest(&manifest).map_err(to_napi_error)?);
+    let registered_cache_namespaces = router.cache_namespaces();
+    register_cache_namespaces(&registered_cache_namespaces);
+    let live_router = Arc::new(LiveRouter {
+        router: ArcSwap::from(router),
+    });
     let tls_acceptor = build_tls_acceptor(&manifest).map_err(to_napi_error)?;
     let tls_enabled = tls_acceptor.is_some();
 
@@ -453,7 +555,7 @@ pub fn start_server(
         let (closed_tx, closed_rx) = mpsc::channel::<()>();
         closed_receivers.push(closed_rx);
 
-        let thread_router = Arc::clone(&router);
+        let thread_live_router = Arc::clone(&live_router);
         let thread_dispatcher = Arc::clone(&dispatcher);
         let thread_config = Arc::clone(&server_config);
         let thread_shutdown = Arc::clone(&shutdown_flag);
@@ -481,7 +583,7 @@ pub fn start_server(
                     let _ = thread_startup_tx.send(Ok(local_addr));
                     run_server(
                         listener,
-                        thread_router,
+                        thread_live_router,
                         thread_dispatcher,
                         thread_config,
                         thread_tls_acceptor,
@@ -549,6 +651,8 @@ pub fn start_server(
         } else {
             format!("http://{host}:{port}")
         },
+        live_router,
+        cache_namespaces: Mutex::new(registered_cache_namespaces),
         shutdown: Mutex::new(Some(ShutdownHandle {
             flag: shutdown_flag,
             wake_addrs,
@@ -597,7 +701,7 @@ impl JsDispatcher {
 
 async fn run_server(
     listener: TcpListener,
-    router: Arc<Router>,
+    live_router: Arc<LiveRouter>,
     dispatcher: Arc<JsDispatcher>,
     server_config: Arc<HttpServerConfig>,
     tls_acceptor: Option<TlsAcceptor>,
@@ -606,11 +710,12 @@ async fn run_server(
 ) -> Result<()> {
     // Wrap Arc in Rc for cheap per-connection cloning within this single-threaded
     // worker — avoids atomic ref-count operations on every accepted connection.
-    let router: Rc<Arc<Router>> = Rc::new(router);
+    let live_router: Rc<Arc<LiveRouter>> = Rc::new(live_router);
     let dispatcher: Rc<Arc<JsDispatcher>> = Rc::new(dispatcher);
     let server_config: Rc<Arc<HttpServerConfig>> = Rc::new(server_config);
     let tls_acceptor: Option<Rc<TlsAcceptor>> = tls_acceptor.map(Rc::new);
-    let session_store: Option<Rc<Arc<session::SessionStore>>> = session_store.map(Rc::new);
+    let session_store: Option<Rc<Arc<session::SessionStore>>> =
+        session_store.map(Rc::new);
 
     let active_connections: std::cell::Cell<usize> = std::cell::Cell::new(0);
 
@@ -635,7 +740,7 @@ async fn run_server(
                     eprintln!("[http-native] failed to enable TCP_NODELAY: {error}");
                 }
 
-                let router = Rc::clone(&router);
+                let live_router = Rc::clone(&live_router);
                 let dispatcher = Rc::clone(&dispatcher);
                 let server_config = Rc::clone(&server_config);
                 let tls_acceptor = tls_acceptor.clone();
@@ -651,7 +756,7 @@ async fn run_server(
                             Ok(tls_stream) => {
                                 handle_connection(
                                     tls_stream,
-                                    router,
+                                    live_router,
                                     dispatcher,
                                     server_config,
                                     session_store,
@@ -661,15 +766,16 @@ async fn run_server(
                             Err(error) => Err(anyhow!("TLS accept failed: {error}")),
                         }
                     } else {
-                        handle_connection(stream, router, dispatcher, server_config, session_store)
+                        handle_connection(stream, live_router, dispatcher, server_config, session_store)
                             .await
                     };
                     if let Err(error) = connection_result {
                         eprintln!("[http-native] connection error: {error}");
                     }
                     // Safety: single-threaded — pointer is always valid while server runs
-                    unsafe { &*conn_counter }
-                        .set(unsafe { &*conn_counter }.get().saturating_sub(1));
+                    unsafe { &*conn_counter }.set(
+                        unsafe { &*conn_counter }.get().saturating_sub(1),
+                    );
                 });
             }
             Err(error) => {
@@ -714,11 +820,11 @@ const TIMEOUT_HEADER_READ: Duration = Duration::from_secs(30);
 const TIMEOUT_IDLE_KEEPALIVE: Duration = Duration::from_secs(120);
 const TIMEOUT_BODY_READ: Duration = Duration::from_secs(60);
 
-// ─── Connection Handler with Buffer Pool
+// ─── Connection Handler with Buffer Pool 
 
 async fn handle_connection<S>(
     mut stream: S,
-    router: Rc<Arc<Router>>,
+    live_router: Rc<Arc<LiveRouter>>,
     dispatcher: Rc<Arc<JsDispatcher>>,
     server_config: Rc<Arc<HttpServerConfig>>,
     session_store: Option<Rc<Arc<session::SessionStore>>>,
@@ -731,7 +837,7 @@ where
     let result = handle_connection_inner(
         &mut stream,
         &mut buffer,
-        &router,
+        live_router.as_ref().as_ref(),
         &dispatcher,
         &server_config,
         session_store.as_deref().map(|arc| arc.as_ref()),
@@ -745,7 +851,7 @@ where
 async fn handle_connection_inner<S>(
     stream: &mut S,
     buffer: &mut Vec<u8>,
-    router: &Router,
+    live_router: &LiveRouter,
     dispatcher: &JsDispatcher,
     server_config: &HttpServerConfig,
     session_store: Option<&session::SessionStore>,
@@ -756,6 +862,8 @@ where
     let mut is_first_request = true;
 
     loop {
+        let router = live_router.router.load_full();
+
         // Try hot-path parsing first (GET / with known prefix)
         let parsed = loop {
             let result = if router.exact_get_root().is_some() {
@@ -782,7 +890,7 @@ where
             } else {
                 TIMEOUT_IDLE_KEEPALIVE
             };
-
+            
             let timeout_result = timeout(read_duration, stream.read(owned_buf)).await;
             let (read_result, next_buffer) = match timeout_result {
                 Ok(res) => res,
@@ -791,7 +899,7 @@ where
                     return Ok(());
                 }
             };
-
+            
             *buffer = next_buffer;
             let bytes_read = read_result?;
 
@@ -828,11 +936,7 @@ where
                 // TE + CL = request smuggling vector
                 (400u16, &b"{\"error\":\"Bad Request: conflicting Content-Length and Transfer-Encoding\"}"[..])
             } else {
-                (
-                    501u16,
-                    &b"{\"error\":\"Not Implemented: chunked transfer encoding is not supported\"}"
-                        [..],
-                )
+                (501u16, &b"{\"error\":\"Not Implemented: chunked transfer encoding is not supported\"}"[..])
             };
             let response = build_error_response_bytes(status, body, false);
             let (write_result, _) = stream.write_all(response).await;
@@ -870,9 +974,7 @@ where
         // ── WebSocket upgrade check ──
         if parsed.is_websocket_upgrade {
             if let Some(ws_key) = parsed.ws_key {
-                if let Some(ws_handler_id) =
-                    router.match_ws_route(std::str::from_utf8(parsed.path).unwrap_or("/"))
-                {
+                if let Some(ws_handler_id) = router.match_ws_route(std::str::from_utf8(parsed.path).unwrap_or("/")) {
                     let accept_key = crate::websocket::compute_accept_key(ws_key);
                     let upgrade_response = crate::websocket::build_upgrade_response(&accept_key);
                     drop(parsed);
@@ -892,7 +994,7 @@ where
         // Build dispatch envelope directly from borrowed parse data, avoiding
         // String/Vec allocations for method, target, path, and headers.
         if !has_body {
-            let dispatch_decision = build_dispatch_decision_zero_copy(router, &parsed, &[])?;
+            let dispatch_decision = build_dispatch_decision_zero_copy(router.as_ref(), &parsed, &[])?;
 
             // Extract session before dropping parsed
             let (session_id, is_new_session) = resolve_session(session_store, parsed.cookie_header);
@@ -901,25 +1003,9 @@ where
             drain_consumed_bytes(buffer, header_bytes);
 
             match dispatch_decision {
-                DispatchDecision::BridgeRequest(
-                    request,
-                    cache_insertion,
-                    handler_id,
-                    url_bytes,
-                ) => {
-                    write_dynamic_dispatch_response(
-                        stream,
-                        dispatcher,
-                        request,
-                        keep_alive,
-                        cache_insertion,
-                        handler_id,
-                        &url_bytes,
-                        session_store,
-                        session_id,
-                        is_new_session,
-                    )
-                    .await?;
+                DispatchDecision::BridgeRequest(request, cache_insertion, handler_id, cache_namespace, url_bytes) => {
+                    write_dynamic_dispatch_response(stream, dispatcher, request, keep_alive, cache_insertion, handler_id, cache_namespace, &url_bytes, session_store, session_id, is_new_session)
+                        .await?;
                 }
                 DispatchDecision::SpecializedResponse(response) => {
                     let (write_result, _) = stream.write_all(response).await;
@@ -947,11 +1033,10 @@ where
             .iter()
             .map(|(n, v)| (n.to_string(), v.to_string()))
             .collect();
-        let (session_id_body, is_new_session_body) =
-            resolve_session(session_store, parsed.cookie_header);
+        let (session_id_body, is_new_session_body) = resolve_session(session_store, parsed.cookie_header);
         drop(parsed);
 
-        // ── Read request body
+        // ── Read request body 
         let body_bytes: Vec<u8> = {
             let content_length = match content_length {
                 Some(len) => len,
@@ -1011,7 +1096,7 @@ where
         };
 
         let dispatch_decision_owned = build_dispatch_decision_owned(
-            router,
+            router.as_ref(),
             &method_owned,
             &target_owned,
             &path_owned,
@@ -1020,20 +1105,8 @@ where
         )?;
 
         match dispatch_decision_owned {
-            DispatchDecision::BridgeRequest(request, cache_insertion, handler_id, url_bytes) => {
-                write_dynamic_dispatch_response(
-                    stream,
-                    dispatcher,
-                    request,
-                    keep_alive,
-                    cache_insertion,
-                    handler_id,
-                    &url_bytes,
-                    session_store,
-                    session_id_body,
-                    is_new_session_body,
-                )
-                .await?;
+            DispatchDecision::BridgeRequest(request, cache_insertion, handler_id, cache_namespace, url_bytes) => {
+                write_dynamic_dispatch_response(stream, dispatcher, request, keep_alive, cache_insertion, handler_id, cache_namespace, &url_bytes, session_store, session_id_body, is_new_session_body).await?;
             }
             DispatchDecision::SpecializedResponse(response) => {
                 let (write_result, _) = stream.write_all(response).await;
@@ -1259,8 +1332,8 @@ fn parse_hot_root_request(
 /// avoiding all String/Vec allocations for method, target, path, and headers.
 /// Used for non-body requests (GET, DELETE without body, etc.).
 enum DispatchDecision {
-    /// (envelope, route-level cache insertion, handler_id, url_bytes for ncache key)
-    BridgeRequest(Buffer, Option<(u32, u64, usize, u64)>, u32, Vec<u8>),
+    /// (envelope, route-level cache insertion, handler_id, cache_namespace, url_bytes for ncache key)
+    BridgeRequest(Buffer, Option<(u64, u64, usize, u64)>, u32, Option<u64>, Vec<u8>),
     SpecializedResponse(Vec<u8>),
     CachedResponse(bytes::Bytes),
 }
@@ -1271,46 +1344,12 @@ fn build_dispatch_decision_zero_copy(
     body: &[u8],
 ) -> Result<DispatchDecision> {
     let method_code = method_code_from_bytes(parsed.method).unwrap_or(UNKNOWN_METHOD_CODE);
-    // Phase 6: Use from_utf8 (faster) instead of from_utf8_lossy for valid UTF-8 paths.
-    // httparse already validates the request line, so paths are almost always valid UTF-8.
-    let path_str = match std::str::from_utf8(parsed.path) {
-        Ok(s) => s,
-        Err(_) => {
-            return build_not_found_dispatch_envelope(
-                method_code,
-                &String::from_utf8_lossy(parsed.path),
-                &String::from_utf8_lossy(parsed.target),
-                &parsed.headers,
-                body,
-            )
-            .map(|envelope| {
-                DispatchDecision::BridgeRequest(envelope, None, NOT_FOUND_HANDLER_ID, Vec::new())
-            })
-        }
-    };
-    let url_str = match std::str::from_utf8(parsed.target) {
-        Ok(s) => s,
-        Err(_) => {
-            return build_not_found_dispatch_envelope(
-                method_code,
-                path_str,
-                &String::from_utf8_lossy(parsed.target),
-                &parsed.headers,
-                body,
-            )
-            .map(|envelope| {
-                DispatchDecision::BridgeRequest(envelope, None, NOT_FOUND_HANDLER_ID, Vec::new())
-            })
-        }
-    };
+    let path_cow = String::from_utf8_lossy(parsed.path);
+    let path_str = path_cow.as_ref();
+    let url_cow = String::from_utf8_lossy(parsed.target);
+    let url_str = url_cow.as_ref();
 
-    // Phase 7: Inline fast-path for normalize_runtime_path — avoid function call
-    // when path is already clean (no trailing slash, or is exactly "/")
-    let normalized_path = if !path_str.ends_with('/') || path_str == "/" {
-        Cow::Borrowed(path_str)
-    } else {
-        normalize_runtime_path(path_str)
-    };
+    let normalized_path = normalize_runtime_path(path_str);
     if contains_path_traversal(&normalized_path) {
         return build_not_found_dispatch_envelope(
             method_code,
@@ -1319,9 +1358,7 @@ fn build_dispatch_decision_zero_copy(
             &parsed.headers,
             body,
         )
-        .map(|envelope| {
-            DispatchDecision::BridgeRequest(envelope, None, NOT_FOUND_HANDLER_ID, Vec::new())
-        });
+        .map(|envelope| DispatchDecision::BridgeRequest(envelope, None, NOT_FOUND_HANDLER_ID, None, Vec::new()));
     }
 
     let matched_route = if method_code == UNKNOWN_METHOD_CODE {
@@ -1338,44 +1375,27 @@ fn build_dispatch_decision_zero_copy(
             &parsed.headers,
             body,
         )
-        .map(|envelope| {
-            DispatchDecision::BridgeRequest(envelope, None, NOT_FOUND_HANDLER_ID, Vec::new())
-        });
+        .map(|envelope| DispatchDecision::BridgeRequest(envelope, None, NOT_FOUND_HANDLER_ID, None, Vec::new()));
     };
 
     let mut cache_insertion = None;
     if let Some(cfg) = matched_route.cache_config {
-        let key = crate::router::interpolate_cache_key(
-            cfg,
-            parsed,
-            url_str,
-            matched_route.param_names,
-            &matched_route.param_values,
-        );
-        if let Some(cached_response) =
-            crate::router::get_cached_response(matched_route.handler_id, key, parsed.keep_alive)
-        {
-            return Ok(DispatchDecision::CachedResponse(cached_response));
-        }
-        cache_insertion = Some((matched_route.handler_id, key, cfg.max_entries, cfg.ttl_secs));
+         let key = crate::router::interpolate_cache_key(cfg, parsed, url_str, matched_route.param_names, &matched_route.param_values);
+         if let Some(cached_response) = crate::router::get_cached_response(matched_route.cache_namespace, key, parsed.keep_alive) {
+             return Ok(DispatchDecision::CachedResponse(cached_response));
+         }
+         cache_insertion = Some((matched_route.cache_namespace, key, cfg.max_entries, cfg.ttl_secs));
     } else {
         // ncache lookup: check if a previous res.ncache() call cached this response
-        let ncache_key = compute_ncache_key(matched_route.handler_id, parsed.target);
-        if let Some(cached_response) = crate::router::get_cached_response(
-            matched_route.handler_id,
-            ncache_key,
-            parsed.keep_alive,
-        ) {
+        let ncache_key = compute_ncache_key(parsed.target);
+        if let Some(cached_response) = crate::router::get_cached_response(matched_route.cache_namespace, ncache_key, parsed.keep_alive) {
             return Ok(DispatchDecision::CachedResponse(cached_response));
         }
     }
 
-    if let Some(response) = build_dynamic_fast_path_response(
-        &matched_route,
-        url_str,
-        &parsed.headers,
-        parsed.keep_alive,
-    )? {
+    if let Some(response) =
+        build_dynamic_fast_path_response(&matched_route, url_str, &parsed.headers, parsed.keep_alive)?
+    {
         return Ok(DispatchDecision::SpecializedResponse(response));
     };
 
@@ -1390,9 +1410,13 @@ fn build_dispatch_decision_zero_copy(
         &parsed.headers,
         body,
     )
-    .map(|envelope| {
-        DispatchDecision::BridgeRequest(envelope, cache_insertion, handler_id, url_bytes_owned)
-    })
+    .map(|envelope| DispatchDecision::BridgeRequest(
+        envelope,
+        cache_insertion,
+        handler_id,
+        Some(matched_route.cache_namespace),
+        url_bytes_owned,
+    ))
 }
 
 fn build_dispatch_decision_owned(
@@ -1405,24 +1429,18 @@ fn build_dispatch_decision_owned(
 ) -> Result<DispatchDecision> {
     let method_code = method_code_from_bytes(method).unwrap_or(UNKNOWN_METHOD_CODE);
 
-    // Phase 6: Use from_utf8 (faster) instead of from_utf8_lossy for valid UTF-8 paths
-    let path_str = std::str::from_utf8(path).unwrap_or_else(|_| {
-        // Safety fallback: this is extremely rare — httparse validates the request line
-        ""
-    });
-    let url_str = std::str::from_utf8(target).unwrap_or_else(|_| "");
+    let path_cow = String::from_utf8_lossy(path);
+    let path_str = path_cow.as_ref();
+    let url_cow = String::from_utf8_lossy(target);
+    let url_str = url_cow.as_ref();
 
     let header_refs: Vec<(&str, &str)> = headers
         .iter()
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .collect();
 
-    // Phase 7: Inline fast-path for normalize_runtime_path
-    let normalized_path = if !path_str.ends_with('/') || path_str == "/" {
-        Cow::Borrowed(path_str)
-    } else {
-        normalize_runtime_path(path_str)
-    };
+    // Security: strict path validation
+    let normalized_path = normalize_runtime_path(path_str);
     if contains_path_traversal(&normalized_path) {
         return build_not_found_dispatch_envelope(
             method_code,
@@ -1431,9 +1449,7 @@ fn build_dispatch_decision_owned(
             &header_refs,
             body,
         )
-        .map(|envelope| {
-            DispatchDecision::BridgeRequest(envelope, None, NOT_FOUND_HANDLER_ID, Vec::new())
-        });
+        .map(|envelope| DispatchDecision::BridgeRequest(envelope, None, NOT_FOUND_HANDLER_ID, None, Vec::new()));
     }
 
     let matched_route = if method_code == UNKNOWN_METHOD_CODE {
@@ -1450,41 +1466,31 @@ fn build_dispatch_decision_owned(
             &header_refs,
             body,
         )
-        .map(|envelope| {
-            DispatchDecision::BridgeRequest(envelope, None, NOT_FOUND_HANDLER_ID, Vec::new())
-        });
+        .map(|envelope| DispatchDecision::BridgeRequest(envelope, None, NOT_FOUND_HANDLER_ID, None, Vec::new()));
     };
 
     let mut cache_insertion = None;
     if let Some(cfg) = matched_route.cache_config {
-        let mock_parsed = ParsedRequest {
-            method,
-            target,
-            path,
-            keep_alive: false,
-            header_bytes: 0,
-            has_body: true,
-            content_length: None,
-            has_chunked_te: false,
-            headers: header_refs.clone(),
-            cookie_header: None,
-            is_websocket_upgrade: false,
-            ws_key: None,
-        };
-        let key = crate::router::interpolate_cache_key(
-            cfg,
-            &mock_parsed,
-            url_str,
-            matched_route.param_names,
-            &matched_route.param_values,
-        );
-        cache_insertion = Some((matched_route.handler_id, key, cfg.max_entries, cfg.ttl_secs));
+         let mock_parsed = ParsedRequest {
+             method,
+             target,
+             path,
+             keep_alive: false,
+             header_bytes: 0,
+             has_body: true,
+             content_length: None,
+             has_chunked_te: false,
+             headers: header_refs.clone(),
+             cookie_header: None,
+             is_websocket_upgrade: false,
+             ws_key: None,
+         };
+         let key = crate::router::interpolate_cache_key(cfg, &mock_parsed, url_str, matched_route.param_names, &matched_route.param_values);
+         cache_insertion = Some((matched_route.cache_namespace, key, cfg.max_entries, cfg.ttl_secs));
     } else {
         // ncache lookup: check if a previous res.ncache() call cached this response
-        let ncache_key = compute_ncache_key(matched_route.handler_id, target);
-        if let Some(cached_response) =
-            crate::router::get_cached_response(matched_route.handler_id, ncache_key, false)
-        {
+        let ncache_key = compute_ncache_key(target);
+        if let Some(cached_response) = crate::router::get_cached_response(matched_route.cache_namespace, ncache_key, false) {
             return Ok(DispatchDecision::CachedResponse(cached_response));
         }
     }
@@ -1500,9 +1506,13 @@ fn build_dispatch_decision_owned(
         &header_refs,
         body,
     )
-    .map(|envelope| {
-        DispatchDecision::BridgeRequest(envelope, cache_insertion, handler_id, url_bytes_owned)
-    })
+    .map(|envelope| DispatchDecision::BridgeRequest(
+        envelope,
+        cache_insertion,
+        handler_id,
+        Some(matched_route.cache_namespace),
+        url_bytes_owned,
+    ))
 }
 
 fn build_not_found_dispatch_envelope(
@@ -1515,7 +1525,7 @@ fn build_not_found_dispatch_envelope(
     let url_bytes = url.as_bytes();
     let path_bytes = path.as_bytes();
     let mut flags: u16 = 0;
-    if memchr::memchr(b'?', url_bytes).is_some() {
+    if url.contains('?') {
         flags |= REQUEST_FLAG_QUERY_PRESENT;
     }
     if !body.is_empty() {
@@ -1565,18 +1575,10 @@ fn build_dispatch_envelope(
 ) -> Result<Buffer> {
     let include_url = matched_route.needs_url || matched_route.needs_query;
     let include_path = matched_route.needs_path;
-    let url_bytes = if include_url {
-        url.as_bytes()
-    } else {
-        b"" as &[u8]
-    };
-    let path_bytes = if include_path {
-        path.as_bytes()
-    } else {
-        b"" as &[u8]
-    };
+    let url_bytes = if include_url { url.as_bytes() } else { b"" };
+    let path_bytes = if include_path { path.as_bytes() } else { b"" };
     let mut flags: u16 = 0;
-    if matched_route.needs_query && memchr::memchr(b'?', url.as_bytes()).is_some() {
+    if matched_route.needs_query && url.contains('?') {
         flags |= REQUEST_FLAG_QUERY_PRESENT;
     }
     if !body.is_empty() {
@@ -1592,34 +1594,14 @@ fn build_dispatch_envelope(
     if matched_route.param_values.len() > u16::MAX as usize {
         return Err(anyhow!("too many params"));
     }
-
-    // Single-pass: determine which headers to include and compute count + size simultaneously.
-    // This avoids the previous double-iteration (count_selected_headers + write loop).
-    let full_headers = matched_route.full_headers;
-    let header_keys = matched_route.header_keys;
-    let no_headers = !full_headers && header_keys.is_empty();
-
-    let mut selected_header_count = 0u16;
-    let mut header_data_size = 0usize;
-    if !no_headers {
-        for (name, value) in header_entries {
-            if full_headers
-                || header_keys
-                    .iter()
-                    .any(|target| target.as_ref().eq_ignore_ascii_case(name))
-            {
-                selected_header_count += 1;
-                header_data_size += 3 + name.len() + value.len(); // 1 (name_len) + 2 (value_len) + name + value
-            }
-        }
+    let selected_header_count = count_selected_headers(header_entries, matched_route);
+    if selected_header_count > u16::MAX as usize {
+        return Err(anyhow!("too many headers"));
     }
 
-    // Pre-compute exact frame size to avoid reallocation
-    let param_data_size: usize = matched_route.param_values.iter().map(|v| 2 + v.len()).sum();
-    let frame_size =
-        20 + url_bytes.len() + path_bytes.len() + param_data_size + header_data_size + body.len();
-
-    let mut frame = Vec::with_capacity(frame_size);
+    let mut frame = Vec::with_capacity(
+        20 + url_bytes.len() + path_bytes.len() + selected_header_count * 16 + body.len(),
+    );
     frame.push(BRIDGE_VERSION);
     frame.push(method_code);
     push_u16(&mut frame, flags);
@@ -1627,8 +1609,8 @@ fn build_dispatch_envelope(
     push_u32(&mut frame, url_bytes.len() as u32);
     push_u16(&mut frame, path_bytes.len() as u16);
     push_u16(&mut frame, matched_route.param_values.len() as u16);
-    push_u16(&mut frame, selected_header_count);
-    push_u32(&mut frame, body.len() as u32);
+    push_u16(&mut frame, selected_header_count as u16);
+    push_u32(&mut frame, body.len() as u32); // NEW: body length
     frame.extend_from_slice(url_bytes);
     frame.extend_from_slice(path_bytes);
 
@@ -1636,22 +1618,45 @@ fn build_dispatch_envelope(
         push_string_value(&mut frame, value)?;
     }
 
-    // Single-pass header write (no separate count step needed)
     if selected_header_count > 0 {
         for (name, value) in header_entries {
-            if full_headers
-                || header_keys
-                    .iter()
-                    .any(|target| target.as_ref().eq_ignore_ascii_case(name))
-            {
+            if should_include_header(name, matched_route) {
                 push_string_pair(&mut frame, name, value)?;
             }
         }
     }
 
-    frame.extend_from_slice(body);
+    frame.extend_from_slice(body); // NEW: body bytes at end
 
     Ok(Buffer::from(frame))
+}
+
+fn count_selected_headers(
+    header_entries: &[(&str, &str)],
+    matched_route: &MatchedRoute<'_, '_>,
+) -> usize {
+    if matched_route.full_headers {
+        return header_entries.len();
+    }
+
+    if matched_route.header_keys.is_empty() {
+        return 0;
+    }
+
+    header_entries
+        .iter()
+        .filter(|(name, _)| should_include_header(name, matched_route))
+        .count()
+}
+
+fn should_include_header(name: &str, matched_route: &MatchedRoute<'_, '_>) -> bool {
+    if matched_route.full_headers {
+        return true;
+    }
+    matched_route
+        .header_keys
+        .iter()
+        .any(|target| target.as_ref().eq_ignore_ascii_case(name))
 }
 
 enum ResolvedDynamicValue {
@@ -1771,23 +1776,27 @@ fn render_dynamic_text_body(
     for segment in template.segments.iter() {
         match segment {
             TextSegment::Literal(value) => output.push_str(value.as_ref()),
-            TextSegment::Dynamic(source) => {
-                match resolve_dynamic_value(source, matched_route, url, headers, query_cache) {
-                    ResolvedDynamicValue::Missing => output.push_str("undefined"),
-                    ResolvedDynamicValue::Single(value) => output.push_str(value.as_str()),
-                    ResolvedDynamicValue::Multi(values) => {
-                        for (index, value) in values.iter().enumerate() {
-                            if index > 0 {
-                                output.push(',');
-                            }
-                            output.push_str(value.as_str());
+            TextSegment::Dynamic(source) => match resolve_dynamic_value(
+                source,
+                matched_route,
+                url,
+                headers,
+                query_cache,
+            ) {
+                ResolvedDynamicValue::Missing => output.push_str("undefined"),
+                ResolvedDynamicValue::Single(value) => output.push_str(value.as_str()),
+                ResolvedDynamicValue::Multi(values) => {
+                    for (index, value) in values.iter().enumerate() {
+                        if index > 0 {
+                            output.push(',');
                         }
-                    }
-                    ResolvedDynamicValue::RawJson(bytes) => {
-                        output.push_str(String::from_utf8_lossy(bytes.as_slice()).as_ref());
+                        output.push_str(value.as_str());
                     }
                 }
-            }
+                ResolvedDynamicValue::RawJson(bytes) => {
+                    output.push_str(String::from_utf8_lossy(bytes.as_slice()).as_ref());
+                }
+            },
         }
     }
 
@@ -2088,8 +2097,7 @@ fn extract_ncache_trailer(dispatch_bytes: &[u8]) -> Option<(u64, usize)> {
         }
         let name_len = dispatch_bytes[offset] as usize;
         offset += 1;
-        let value_len =
-            (dispatch_bytes[offset] as u16) | ((dispatch_bytes[offset + 1] as u16) << 8);
+        let value_len = (dispatch_bytes[offset] as u16) | ((dispatch_bytes[offset + 1] as u16) << 8);
         offset += 2;
         offset += name_len + value_len as usize;
     }
@@ -2125,15 +2133,14 @@ fn extract_ncache_trailer(dispatch_bytes: &[u8]) -> Option<(u64, usize)> {
     Some((ttl_secs, max_entries as usize))
 }
 
-/// Compute an ncache key from handler_id + full request URL (including query string).
+/// Compute an ncache key from the full request URL (including query string).
 /// Different URLs naturally produce different cache keys, so /data?page=1 and
 /// /data?page=2 are cached separately.
 /// Uses FxHasher (~5x faster than SipHash/DefaultHasher for short keys).
-fn compute_ncache_key(handler_id: u32, url_bytes: &[u8]) -> u64 {
-    use rustc_hash::FxHasher;
+fn compute_ncache_key(url_bytes: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
+    use rustc_hash::FxHasher;
     let mut hasher = FxHasher::default();
-    handler_id.hash(&mut hasher);
     url_bytes.hash(&mut hasher);
     hasher.finish()
 }
@@ -2167,13 +2174,10 @@ fn response_body_end_offset(dispatch_bytes: &[u8]) -> Option<usize> {
 
     // Skip headers
     for _ in 0..header_count {
-        if offset + 3 > dispatch_bytes.len() {
-            return None;
-        }
+        if offset + 3 > dispatch_bytes.len() { return None; }
         let name_len = dispatch_bytes[offset] as usize;
         offset += 1;
-        let value_len =
-            (dispatch_bytes[offset] as u16) | ((dispatch_bytes[offset + 1] as u16) << 8);
+        let value_len = (dispatch_bytes[offset] as u16) | ((dispatch_bytes[offset + 1] as u16) << 8);
         offset += 2;
         offset += name_len + value_len as usize;
     }
@@ -2185,10 +2189,7 @@ fn response_body_end_offset(dispatch_bytes: &[u8]) -> Option<usize> {
 
 /// Extract session write trailer from the response envelope.
 /// Called after the ncache trailer position. Scans from `start_offset`.
-fn extract_session_trailer(
-    dispatch_bytes: &[u8],
-    start_offset: usize,
-) -> Option<SessionWriteTrailer> {
+fn extract_session_trailer(dispatch_bytes: &[u8], start_offset: usize) -> Option<SessionWriteTrailer> {
     let mut offset = start_offset;
 
     // Check for session magic (0x5E 0x57)
@@ -2207,36 +2208,27 @@ fn extract_session_trailer(
     let entry_count = (dispatch_bytes[offset] as u16) | ((dispatch_bytes[offset + 1] as u16) << 8);
     offset += 2;
 
-    let deleted_count =
-        (dispatch_bytes[offset] as u16) | ((dispatch_bytes[offset + 1] as u16) << 8);
+    let deleted_count = (dispatch_bytes[offset] as u16) | ((dispatch_bytes[offset + 1] as u16) << 8);
     offset += 2;
 
     let mut mutations = std::collections::HashMap::new();
     for _ in 0..entry_count {
-        if offset + 2 > dispatch_bytes.len() {
-            return None;
-        }
+        if offset + 2 > dispatch_bytes.len() { return None; }
         let key_len = (dispatch_bytes[offset] as u16) | ((dispatch_bytes[offset + 1] as u16) << 8);
         offset += 2;
         let key_len = key_len as usize;
-        if offset + key_len > dispatch_bytes.len() {
-            return None;
-        }
+        if offset + key_len > dispatch_bytes.len() { return None; }
         let key = std::str::from_utf8(&dispatch_bytes[offset..offset + key_len]).ok()?;
         offset += key_len;
 
-        if offset + 4 > dispatch_bytes.len() {
-            return None;
-        }
+        if offset + 4 > dispatch_bytes.len() { return None; }
         let value_len = (dispatch_bytes[offset] as u32)
             | ((dispatch_bytes[offset + 1] as u32) << 8)
             | ((dispatch_bytes[offset + 2] as u32) << 16)
             | ((dispatch_bytes[offset + 3] as u32) << 24);
         offset += 4;
         let value_len = value_len as usize;
-        if offset + value_len > dispatch_bytes.len() {
-            return None;
-        }
+        if offset + value_len > dispatch_bytes.len() { return None; }
         let value = dispatch_bytes[offset..offset + value_len].to_vec();
         offset += value_len;
 
@@ -2245,15 +2237,11 @@ fn extract_session_trailer(
 
     let mut deleted_keys = Vec::new();
     for _ in 0..deleted_count {
-        if offset + 2 > dispatch_bytes.len() {
-            return None;
-        }
+        if offset + 2 > dispatch_bytes.len() { return None; }
         let key_len = (dispatch_bytes[offset] as u16) | ((dispatch_bytes[offset + 1] as u16) << 8);
         offset += 2;
         let key_len = key_len as usize;
-        if offset + key_len > dispatch_bytes.len() {
-            return None;
-        }
+        if offset + key_len > dispatch_bytes.len() { return None; }
         let key = std::str::from_utf8(&dispatch_bytes[offset..offset + key_len]).ok()?;
         offset += key_len;
         deleted_keys.push(key.to_string());
@@ -2271,8 +2259,9 @@ async fn write_dynamic_dispatch_response<S>(
     dispatcher: &JsDispatcher,
     request: Buffer,
     keep_alive: bool,
-    cache_insertion: Option<(u32, u64, usize, u64)>,
+    cache_insertion: Option<(u64, u64, usize, u64)>,
     handler_id: u32,
+    cache_namespace: Option<u64>,
     url_bytes: &[u8],
     session_store: Option<&session::SessionStore>,
     session_id: Option<[u8; session::SESSION_ID_BYTES]>,
@@ -2295,9 +2284,11 @@ where
                         .map_err(|_| anyhow!("stream envelope truncated"))?,
                 );
                 off += 8;
-                let status = u16::from_le_bytes([response[off], response[off + 1]]);
+                let status =
+                    u16::from_le_bytes([response[off], response[off + 1]]);
                 off += 2;
-                let header_count = u16::from_le_bytes([response[off], response[off + 1]]) as usize;
+                let header_count =
+                    u16::from_le_bytes([response[off], response[off + 1]]) as usize;
                 off += 2;
 
                 // Create the channel — Sender goes into the registry so JS can push
@@ -2365,8 +2356,7 @@ where
                             }
                             // HTTP/1.1 chunked format: {hex_len}\r\n{data}\r\n
                             let hex_len = format!("{:x}", data.len());
-                            let mut chunk_buf =
-                                Vec::with_capacity(hex_len.len() + 2 + data.len() + 2);
+                            let mut chunk_buf = Vec::with_capacity(hex_len.len() + 2 + data.len() + 2);
                             chunk_buf.extend_from_slice(hex_len.as_bytes());
                             chunk_buf.extend_from_slice(b"\r\n");
                             chunk_buf.extend_from_slice(&data);
@@ -2392,7 +2382,7 @@ where
 
             match build_http_response_from_dispatch(response.as_ref(), keep_alive) {
                 Ok(mut http_response) => {
-                    if let Some((handler_id, cache_key, max_entries, ttl_secs)) = cache_insertion {
+                    if let Some((cache_namespace, cache_key, max_entries, ttl_secs)) = cache_insertion {
                         // Route-level cache insertion (takes precedence over ncache)
                         // Derive the alternate connection variant by patching the header bytes
                         let response_bytes_close: bytes::Bytes = if !keep_alive {
@@ -2406,47 +2396,35 @@ where
                             patch_connection_header(&http_response, true).into()
                         };
 
-                        crate::router::insert_cached_response(
-                            handler_id,
-                            cache_key,
-                            crate::router::CacheEntry {
-                                response_bytes: response_ka,
-                                response_bytes_close,
-                                expires_at: std::time::Instant::now()
-                                    + std::time::Duration::from_secs(ttl_secs),
-                            },
-                            max_entries,
-                        );
+                        crate::router::insert_cached_response(cache_namespace, cache_key, crate::router::CacheEntry {
+                            response_bytes: response_ka,
+                            response_bytes_close,
+                            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(ttl_secs),
+                        }, max_entries);
                     } else if handler_id != NOT_FOUND_HANDLER_ID {
                         // Check for ncache trailer from JS response envelope
-                        if let Some((ncache_ttl, ncache_max_entries)) =
-                            extract_ncache_trailer(response.as_ref())
-                        {
+                        if let Some((ncache_ttl, ncache_max_entries)) = extract_ncache_trailer(response.as_ref()) {
                             if ncache_ttl > 0 {
-                                let ncache_key = compute_ncache_key(handler_id, url_bytes);
+                                if let Some(cache_namespace) = cache_namespace {
+                                    let ncache_key = compute_ncache_key(url_bytes);
 
-                                let response_bytes_close: bytes::Bytes = if !keep_alive {
-                                    http_response.clone().into()
-                                } else {
-                                    patch_connection_header(&http_response, false).into()
-                                };
-                                let response_ka: bytes::Bytes = if keep_alive {
-                                    http_response.clone().into()
-                                } else {
-                                    patch_connection_header(&http_response, true).into()
-                                };
+                                    let response_bytes_close: bytes::Bytes = if !keep_alive {
+                                        http_response.clone().into()
+                                    } else {
+                                        patch_connection_header(&http_response, false).into()
+                                    };
+                                    let response_ka: bytes::Bytes = if keep_alive {
+                                        http_response.clone().into()
+                                    } else {
+                                        patch_connection_header(&http_response, true).into()
+                                    };
 
-                                crate::router::insert_cached_response(
-                                    handler_id,
-                                    ncache_key,
-                                    crate::router::CacheEntry {
+                                    crate::router::insert_cached_response(cache_namespace, ncache_key, crate::router::CacheEntry {
                                         response_bytes: response_ka,
                                         response_bytes_close,
-                                        expires_at: std::time::Instant::now()
-                                            + std::time::Duration::from_secs(ncache_ttl),
-                                    },
-                                    ncache_max_entries,
-                                );
+                                        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(ncache_ttl),
+                                    }, ncache_max_entries);
+                                }
                             }
                         }
                     }
@@ -2463,24 +2441,15 @@ where
                                 session_scan_offset += 10;
                             }
 
-                            if let Some(trailer) =
-                                extract_session_trailer(response.as_ref(), session_scan_offset)
-                            {
+                            if let Some(trailer) = extract_session_trailer(response.as_ref(), session_scan_offset) {
                                 match trailer.action {
                                     session::SessionAction::Update => {
                                         if let Some(sid) = session_id {
-                                            store.upsert(
-                                                &sid,
-                                                trailer.mutations,
-                                                &trailer.deleted_keys,
-                                            );
+                                            store.upsert(&sid, trailer.mutations, &trailer.deleted_keys);
                                             // Inject Set-Cookie for new sessions
                                             if is_new_session {
                                                 let cookie = store.build_set_cookie(&sid);
-                                                inject_set_cookie_header(
-                                                    &mut http_response,
-                                                    &cookie,
-                                                );
+                                                inject_set_cookie_header(&mut http_response, &cookie);
                                             }
                                         }
                                     }
@@ -2500,11 +2469,7 @@ where
                                             if let Some(entry) = old_data {
                                                 store.upsert(&new_sid, entry.data, &[]);
                                             }
-                                            store.upsert(
-                                                &new_sid,
-                                                trailer.mutations,
-                                                &trailer.deleted_keys,
-                                            );
+                                            store.upsert(&new_sid, trailer.mutations, &trailer.deleted_keys);
                                             let cookie = store.build_set_cookie(&new_sid);
                                             inject_set_cookie_header(&mut http_response, &cookie);
                                         }
@@ -2538,8 +2503,11 @@ where
         }
         Err(_) => {
             // Security: sanitized error — no internal details
-            let response =
-                build_error_response_bytes(502, b"{\"error\":\"Bad Gateway\"}", keep_alive);
+            let response = build_error_response_bytes(
+                502,
+                b"{\"error\":\"Bad Gateway\"}",
+                keep_alive,
+            );
             let (write_result, _) = stream.write_all(response).await;
             write_result?;
         }
@@ -2627,15 +2595,9 @@ fn build_http_response_from_dispatch(dispatch_bytes: &[u8], keep_alive: bool) ->
 /// Vec may grow or shrink by a few bytes.
 fn patch_connection_header(response: &[u8], keep_alive: bool) -> Vec<u8> {
     let (find, replace) = if keep_alive {
-        (
-            &b"connection: close\r\n"[..],
-            &b"connection: keep-alive\r\n"[..],
-        )
+        (&b"connection: close\r\n"[..], &b"connection: keep-alive\r\n"[..])
     } else {
-        (
-            &b"connection: keep-alive\r\n"[..],
-            &b"connection: close\r\n"[..],
-        )
+        (&b"connection: keep-alive\r\n"[..], &b"connection: close\r\n"[..])
     };
 
     if let Some(pos) = memmem::find(response, find) {
@@ -2690,6 +2652,7 @@ where
     // Create channel for outbound messages (JS → Rust → client)
     let (tx, rx) = flume::bounded::<StreamMessage>(64);
     stream_registry().insert(ws_id, tx);
+    websocket_connections().insert(ws_id, ());
 
     // Dispatch "open" event to JS
     let open_envelope = build_ws_event_envelope(0x01, ws_id, handler_id, &[]);
@@ -2759,6 +2722,7 @@ where
 
     // Cleanup
     stream_registry().remove(&ws_id);
+    websocket_connections().remove(&ws_id);
 
     // Dispatch "close" event to JS
     let close_envelope = build_ws_event_envelope(0x03, ws_id, handler_id, &[]);
@@ -2803,20 +2767,8 @@ fn build_error_response_bytes(status: u16, body: &[u8], keep_alive: bool) -> Vec
     let connection = if keep_alive { "keep-alive" } else { "close" };
     let body_len = body.len();
 
-    let total_size = 9
-        + 3
-        + 1
-        + reason.len()
-        + 2
-        + 16
-        + count_digits(body_len)
-        + 2
-        + 12
-        + connection.len()
-        + 2
-        + 45
-        + 2
-        + body_len;
+    let total_size =
+        9 + 3 + 1 + reason.len() + 2 + 16 + count_digits(body_len) + 2 + 12 + connection.len() + 2 + 45 + 2 + body_len;
 
     let mut output = Vec::with_capacity(total_size);
     output.extend_from_slice(b"HTTP/1.1 ");
@@ -2833,6 +2785,7 @@ fn build_error_response_bytes(status: u16, body: &[u8], keep_alive: bool) -> Vec
     output
 }
 
+
 // ─── Security Utilities ─────────────────
 
 /// Check for path traversal attempts (../, ..\, etc.)
@@ -2842,37 +2795,19 @@ fn build_error_response_bytes(status: u16, body: &[u8], keep_alive: bool) -> Vec
 fn contains_path_traversal(path: &str) -> bool {
     let bytes = path.as_bytes();
 
-    // Ultra-fast path: scan for any byte that could indicate traversal.
-    // If no '.', '%', '\0', or '\\' exists, traversal is impossible.
-    // This single pass covers 99%+ of clean requests with zero allocations.
-    let mut has_dot = false;
-    let mut has_percent = false;
-    let mut has_null = false;
-    for &b in bytes {
-        match b {
-            b'.' => has_dot = true,
-            b'%' => has_percent = true,
-            0 => has_null = true,
-            _ => {}
-        }
-    }
-
-    if has_null {
+    // Fast scan for null bytes
+    if memchr::memchr(0, bytes).is_some() {
         return true;
-    }
-
-    // No dots and no percent-encoding means no traversal possible
-    if !has_dot && !has_percent {
-        return false;
     }
 
     // Check for literal %00 (null percent-encoding)
-    if has_percent && memmem::find(bytes, b"%00").is_some() {
+    if memmem::find(bytes, b"%00").is_some() {
         return true;
     }
 
-    // Need ".." for traversal — check if it exists
+    // Fast path: if no ".." appears anywhere (even encoded), skip the expensive decode
     let has_dotdot = memmem::find(bytes, b"..").is_some();
+    let has_percent = memchr::memchr(b'%', bytes).is_some();
 
     // If no literal ".." and no percent-encoding that could hide "..", we're safe
     if !has_dotdot && !has_percent {
@@ -3030,7 +2965,10 @@ fn build_tls_acceptor(manifest: &ManifestInput) -> Result<Option<TlsAcceptor>> {
     Ok(Some(TlsAcceptor::from(Arc::new(config))))
 }
 
-fn parse_tls_certificates(pem: &str, source_name: &str) -> Result<Vec<CertificateDer<'static>>> {
+fn parse_tls_certificates(
+    pem: &str,
+    source_name: &str,
+) -> Result<Vec<CertificateDer<'static>>> {
     let mut reader = BufReader::new(pem.as_bytes());
     let certs = rustls_pemfile::certs(&mut reader)
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -3045,7 +2983,8 @@ fn parse_tls_certificates(pem: &str, source_name: &str) -> Result<Vec<Certificat
 
 fn parse_tls_private_key(tls: &TlsConfigInput) -> Result<PrivateKeyDer<'static>> {
     let mut reader = BufReader::new(tls.key.as_bytes());
-    let key = rustls_pemfile::private_key(&mut reader).context("failed to parse tls.key PEM")?;
+    let key = rustls_pemfile::private_key(&mut reader)
+        .context("failed to parse tls.key PEM")?;
 
     if let Some(private_key) = key {
         return Ok(private_key);

@@ -9,6 +9,7 @@ path = "rsrc/src/lib.rs"
 
 [dependencies]
 anyhow = "1.0"
+arc-swap = "1.7"
 base64 = "0.22"
 bytes = "1.10"
 httparse = "1.9"

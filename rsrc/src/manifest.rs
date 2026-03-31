@@ -83,6 +83,7 @@ pub struct RouteInput {
     pub path: String,
     pub route_kind: u8,
     pub handler_id: u32,
+    pub cache_namespace: String,
     pub handler_source: String,
     pub param_names: Vec<String>,
     #[allow(dead_code)]

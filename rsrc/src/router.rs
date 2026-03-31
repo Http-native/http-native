@@ -1,6 +1,9 @@
 use anyhow::Result;
 use bytes::Bytes;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
 use crate::analyzer::{
@@ -12,23 +15,18 @@ use crate::manifest::{ManifestInput, MiddlewareInput, RouteInput};
 const ROUTE_KIND_EXACT: u8 = 1;
 const ROUTE_KIND_PARAM: u8 = 2;
 const MAX_STACK_SEGMENTS: usize = 16;
-/// Maximum number of path parameters supported on the stack.
-/// Routes with more params fall back to heap allocation.
-const MAX_STACK_PARAMS: usize = 8;
-/// Number of methods supported (GET=0..HEAD=6).
-const METHOD_COUNT: usize = 7;
 
 // ─── Public Types ───────────────────────
 
 #[derive(Clone)]
 pub struct Router {
     exact_get_root: Option<ExactStaticRoute>,
-    /// O(1) exact-match routes — array indexed by method code (no hashing)
-    dynamic_exact_routes: [Option<HashMap<Box<[u8]>, DynamicRouteSpec>>; METHOD_COUNT],
-    /// O(1) static-response routes — array indexed by method code
-    exact_static_routes: [Option<HashMap<Box<[u8]>, ExactStaticRoute>>; METHOD_COUNT],
-    /// O(M) radix-tree routes per method — array indexed by method code
-    radix_trees: [Option<RadixNode>; METHOD_COUNT],
+    /// O(1) exact-match routes (HashMap<method, HashMap<path_bytes, spec>>)
+    dynamic_exact_routes: HashMap<MethodKey, HashMap<Box<[u8]>, DynamicRouteSpec>>,
+    /// O(1) static-response routes
+    exact_static_routes: HashMap<MethodKey, HashMap<Box<[u8]>, ExactStaticRoute>>,
+    /// O(M) radix-tree routes per method (M = path length)
+    radix_trees: HashMap<MethodKey, RadixNode>,
     /// WebSocket routes: path → handler_id
     ws_routes: HashMap<String, u32>,
 }
@@ -41,6 +39,7 @@ pub struct ExactStaticRoute {
 
 pub struct MatchedRoute<'a, 'b> {
     pub handler_id: u32,
+    pub cache_namespace: u64,
     pub param_values: Vec<&'b str>,
     pub param_names: &'a [Box<str>],
     pub header_keys: &'a [Box<str>],
@@ -71,6 +70,7 @@ pub enum CacheVaryKey {
 #[derive(Clone)]
 struct DynamicRouteSpec {
     handler_id: u32,
+    cache_namespace: u64,
     param_names: Box<[Box<str>]>,
     header_keys: Box<[Box<str>]>,
     full_headers: bool,
@@ -81,27 +81,29 @@ struct DynamicRouteSpec {
     cache_config: Option<RouteCacheConfig>,
 }
 
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum MethodKey {
+    Delete,
+    Get,
+    Head,
+    Options,
+    Patch,
+    Post,
+    Put,
+}
+
 // ─── Radix Tree ─────────────────────────
 //
 // Each node represents either a static prefix or a parameter capture.
 // Matching is O(M) where M is the number of path segments, not O(N) routes.
-//
-// Optimizations applied:
-// - Children are sorted by segment after tree construction for binary search
-// - `is_unambiguous` flag enables iterative matching without backtracking
-// - Children stored as boxed slice after freeze for cache locality
 
 #[derive(Clone)]
 struct RadixNode {
-    /// Static children — sorted by segment after freeze() for binary search
     children: Vec<RadixChild>,
     /// If this node is a terminal route, the handler spec
     handler: Option<DynamicRouteSpec>,
     /// Parameter capture node for this level
     param_child: Option<Box<RadixParamChild>>,
-    /// True when this node has EITHER static children OR a param child, but not both.
-    /// When true, no backtracking is needed during matching.
-    is_unambiguous: bool,
 }
 
 #[derive(Clone)]
@@ -122,7 +124,6 @@ impl RadixNode {
             children: Vec::new(),
             handler: None,
             param_child: None,
-            is_unambiguous: true,
         }
     }
 
@@ -166,91 +167,11 @@ impl RadixNode {
         }
     }
 
-    /// Freeze the tree after all routes are inserted:
-    /// - Sort children by segment for binary search
-    /// - Compute is_unambiguous flags
-    /// - Recursively freeze all children
-    fn freeze(&mut self) {
-        // Sort children by segment for binary search during matching
-        self.children.sort_by(|a, b| a.segment.cmp(&b.segment));
-
-        // A node is unambiguous if it has EITHER static children OR a param child, not both
-        self.is_unambiguous = self.children.is_empty() || self.param_child.is_none();
-
-        // Recursively freeze children
-        for child in &mut self.children {
-            child.node.freeze();
-        }
-        if let Some(param_child) = &mut self.param_child {
-            param_child.node.freeze();
-        }
-    }
-
-    /// Find a static child by segment using binary search (children must be sorted).
-    #[inline]
-    fn find_static_child(&self, segment: &str) -> Option<&RadixNode> {
-        if self.children.len() <= 4 {
-            // Linear scan is faster for small N due to cache locality
-            for child in &self.children {
-                if child.segment.as_ref() == segment {
-                    return Some(&child.node);
-                }
-            }
-            None
-        } else {
-            // Binary search for larger child sets
-            self.children
-                .binary_search_by(|child| child.segment.as_ref().cmp(segment))
-                .ok()
-                .map(|idx| &self.children[idx].node)
-        }
-    }
-
-    /// Iterative match for unambiguous trees — no backtracking needed.
-    /// Returns the matched spec and writes param values into the provided buffer.
-    /// Returns (spec, param_count) on success.
-    #[inline]
-    fn match_path_iterative<'a, 'b>(
+    /// Match a request path against this radix tree — O(M) where M = segment count
+    fn match_path<'a, 'b>(
         &'a self,
         segments: &[&'b str],
-        param_buf: &mut [&'b str; MAX_STACK_PARAMS],
-    ) -> Option<(&'a DynamicRouteSpec, usize)> {
-        let mut current = self;
-        let mut param_count = 0usize;
-
-        for &segment in segments {
-            // Try static child first
-            if let Some(child_node) = current.find_static_child(segment) {
-                current = child_node;
-                continue;
-            }
-
-            // Try parameter capture
-            if let Some(param_child) = &current.param_child {
-                if param_count < MAX_STACK_PARAMS {
-                    param_buf[param_count] = segment;
-                    param_count += 1;
-                    current = &param_child.node;
-                    continue;
-                }
-                // Overflow — fall through to None
-                return None;
-            }
-
-            // No match
-            return None;
-        }
-
-        current.handler.as_ref().map(|spec| (spec, param_count))
-    }
-
-    /// Recursive match with backtracking — used for ambiguous trees where a node
-    /// has both static children AND a param child at the same level.
-    fn match_path_recursive<'a, 'b>(
-        &'a self,
-        segments: &[&'b str],
-        param_buf: &mut [&'b str; MAX_STACK_PARAMS],
-        param_count: &mut usize,
+        param_values: &mut Vec<&'b str>,
     ) -> Option<&'a DynamicRouteSpec> {
         if segments.is_empty() {
             return self.handler.as_ref();
@@ -260,124 +181,37 @@ impl RadixNode {
         let rest = &segments[1..];
 
         // Try static children first (higher priority)
-        if let Some(child_node) = self.find_static_child(segment) {
-            if let Some(spec) = child_node.match_path_recursive(rest, param_buf, param_count) {
-                return Some(spec);
+        for child in &self.children {
+            if child.segment.as_ref() == segment {
+                if let Some(spec) = child.node.match_path(rest, param_values) {
+                    return Some(spec);
+                }
             }
         }
 
         // Try parameter capture
         if let Some(param_child) = &self.param_child {
-            if *param_count < MAX_STACK_PARAMS {
-                let prev_count = *param_count;
-                param_buf[*param_count] = segment;
-                *param_count += 1;
-                if let Some(spec) =
-                    param_child
-                        .node
-                        .match_path_recursive(rest, param_buf, param_count)
-                {
-                    return Some(spec);
-                }
-                // Backtrack
-                *param_count = prev_count;
+            let prev_len = param_values.len();
+            param_values.push(segment);
+            if let Some(spec) = param_child.node.match_path(rest, param_values) {
+                return Some(spec);
             }
+            // Backtrack
+            param_values.truncate(prev_len);
         }
 
         None
-    }
-
-    /// Check if the entire subtree is unambiguous (no node has both static children and param child)
-    fn is_fully_unambiguous(&self) -> bool {
-        if !self.is_unambiguous {
-            return false;
-        }
-        for child in &self.children {
-            if !child.node.is_fully_unambiguous() {
-                return false;
-            }
-        }
-        if let Some(param_child) = &self.param_child {
-            if !param_child.node.is_fully_unambiguous() {
-                return false;
-            }
-        }
-        true
-    }
-}
-
-// ─── Method Index ───────────────────────
-//
-// Convert method codes to array indices. Method codes are 1-based (GET=1..HEAD=7),
-// array indices are 0-based (GET=0..HEAD=6).
-
-#[inline(always)]
-fn method_index(code: u8) -> Option<usize> {
-    if code >= 1 && code <= 7 {
-        Some((code - 1) as usize)
-    } else {
-        None
-    }
-}
-
-/// Convert a method string to an array index
-fn method_index_from_str(method: &str) -> Option<usize> {
-    match method {
-        "GET" => Some(0),
-        "POST" => Some(1),
-        "PUT" => Some(2),
-        "DELETE" => Some(3),
-        "PATCH" => Some(4),
-        "OPTIONS" => Some(5),
-        "HEAD" => Some(6),
-        _ => None,
-    }
-}
-
-/// Convert method bytes to an array index
-fn method_index_from_bytes(method: &[u8]) -> Option<usize> {
-    match method {
-        b"GET" => Some(0),
-        b"POST" => Some(1),
-        b"PUT" => Some(2),
-        b"DELETE" => Some(3),
-        b"PATCH" => Some(4),
-        b"OPTIONS" => Some(5),
-        b"HEAD" => Some(6),
-        _ => None,
     }
 }
 
 // ─── Router Implementation ──────────────
 
-const NONE_EXACT_MAP: Option<HashMap<Box<[u8]>, DynamicRouteSpec>> = None;
-const NONE_STATIC_MAP: Option<HashMap<Box<[u8]>, ExactStaticRoute>> = None;
-const NONE_RADIX: Option<RadixNode> = None;
-
 impl Router {
     pub fn from_manifest(manifest: &ManifestInput) -> Result<Self> {
         let mut exact_get_root = None;
-        let mut dynamic_exact_routes: [Option<HashMap<Box<[u8]>, DynamicRouteSpec>>; METHOD_COUNT] = [
-            NONE_EXACT_MAP,
-            NONE_EXACT_MAP,
-            NONE_EXACT_MAP,
-            NONE_EXACT_MAP,
-            NONE_EXACT_MAP,
-            NONE_EXACT_MAP,
-            NONE_EXACT_MAP,
-        ];
-        let mut exact_static_routes: [Option<HashMap<Box<[u8]>, ExactStaticRoute>>; METHOD_COUNT] = [
-            NONE_STATIC_MAP,
-            NONE_STATIC_MAP,
-            NONE_STATIC_MAP,
-            NONE_STATIC_MAP,
-            NONE_STATIC_MAP,
-            NONE_STATIC_MAP,
-            NONE_STATIC_MAP,
-        ];
-        let mut radix_trees: [Option<RadixNode>; METHOD_COUNT] = [
-            NONE_RADIX, NONE_RADIX, NONE_RADIX, NONE_RADIX, NONE_RADIX, NONE_RADIX, NONE_RADIX,
-        ];
+        let mut dynamic_exact_routes = HashMap::new();
+        let mut exact_static_routes = HashMap::new();
+        let mut radix_trees: HashMap<MethodKey, RadixNode> = HashMap::new();
 
         for route in &manifest.routes {
             let method = route.method.to_uppercase();
@@ -385,7 +219,7 @@ impl Router {
             if let AnalysisResult::ExactStaticFastPath(spec) =
                 analyze_route(route, &manifest.middlewares)
             {
-                let Some(midx) = method_index_from_str(method.as_str()) else {
+                let Some(method_key) = MethodKey::from_method_str(method.as_str()) else {
                     continue;
                 };
 
@@ -402,46 +236,42 @@ impl Router {
                     )),
                 };
 
-                // GET root fast path
-                if midx == 0 && path == "/" {
+                if method_key == MethodKey::Get && path == "/" {
                     exact_get_root = Some(exact_route);
                     continue;
                 }
 
-                exact_static_routes[midx]
-                    .get_or_insert_with(HashMap::new)
+                exact_static_routes
+                    .entry(method_key)
+                    .or_insert_with(HashMap::new)
                     .insert(Box::<[u8]>::from(path.as_bytes()), exact_route);
                 continue;
             }
 
-            let Some(midx) = method_index(route.method_code) else {
+            let Some(method_key) = MethodKey::from_code(route.method_code) else {
                 continue;
             };
 
             match route.route_kind {
                 ROUTE_KIND_EXACT => {
-                    dynamic_exact_routes[midx]
-                        .get_or_insert_with(HashMap::new)
+                    dynamic_exact_routes
+                        .entry(method_key)
+                        .or_insert_with(HashMap::new)
                         .insert(
                             Box::<[u8]>::from(path.as_bytes()),
                             compile_dynamic_route_spec(route, &manifest.middlewares),
                         );
                 }
                 ROUTE_KIND_PARAM => {
+                    // Insert into radix tree instead of linear Vec
                     let segments = parse_segments(path.as_str());
                     let spec = compile_dynamic_route_spec(route, &manifest.middlewares);
-                    radix_trees[midx]
-                        .get_or_insert_with(RadixNode::new)
+                    radix_trees
+                        .entry(method_key)
+                        .or_insert_with(RadixNode::new)
                         .insert(&segments, spec);
                 }
                 _ => {}
-            }
-        }
-
-        // Freeze all radix trees — sort children, compute unambiguous flags
-        for tree in &mut radix_trees {
-            if let Some(node) = tree {
-                node.freeze();
             }
         }
 
@@ -465,15 +295,17 @@ impl Router {
         method_code: u8,
         path: &'b str,
     ) -> Option<MatchedRoute<'a, 'b>> {
-        let midx = method_index(method_code)?;
+        let method_key = MethodKey::from_code(method_code)?;
 
-        // Fast path: exact match (O(1)) — direct array index, no hashing for method
-        if let Some(route_spec) = self.dynamic_exact_routes[midx]
-            .as_ref()
+        // Fast path: exact match (O(1))
+        if let Some(route_spec) = self
+            .dynamic_exact_routes
+            .get(&method_key)
             .and_then(|routes| routes.get(path.as_bytes()))
         {
             return Some(MatchedRoute {
                 handler_id: route_spec.handler_id,
+                cache_namespace: route_spec.cache_namespace,
                 param_values: Vec::new(),
                 param_names: route_spec.param_names.as_ref(),
                 header_keys: route_spec.header_keys.as_ref(),
@@ -486,98 +318,31 @@ impl Router {
             });
         }
 
-        // Radix tree match — direct array index, no hashing for method
-        let tree = self.radix_trees[midx].as_ref()?;
-
-        // SIMD-accelerated segment splitting into stack buffer
+        // Radix tree match (O(M) where M = segment count)
+        let tree = self.radix_trees.get(&method_key)?;
         let mut seg_buf = [""; MAX_STACK_SEGMENTS];
         let seg_count = split_segments_stack(path, &mut seg_buf);
-        if seg_count > MAX_STACK_SEGMENTS {
-            // Overflow: fall back to heap-allocated segments
+        let mut param_values = Vec::with_capacity(4);
+        let spec = if seg_count <= MAX_STACK_SEGMENTS {
+            tree.match_path(&seg_buf[..seg_count], &mut param_values)?
+        } else {
             let segments = split_request_segments(path);
-            return self.match_radix_heap(tree, &segments);
-        }
-        let segments = &seg_buf[..seg_count];
+            tree.match_path(&segments, &mut param_values)?
+        };
 
-        // Stack-allocated param buffer — no heap allocation for ≤8 params
-        let mut param_buf = [""; MAX_STACK_PARAMS];
-
-        // Choose iterative or recursive matching based on tree ambiguity
-        if tree.is_fully_unambiguous() {
-            // Fast path: iterative matching — no backtracking, no recursion overhead
-            let (spec, param_count) = tree.match_path_iterative(segments, &mut param_buf)?;
-            let param_values = param_buf[..param_count].to_vec();
-            Some(MatchedRoute {
-                handler_id: spec.handler_id,
-                param_values,
-                param_names: spec.param_names.as_ref(),
-                header_keys: spec.header_keys.as_ref(),
-                full_headers: spec.full_headers,
-                needs_path: spec.needs_path,
-                needs_url: spec.needs_url,
-                needs_query: spec.needs_query,
-                fast_path: spec.fast_path.as_ref(),
-                cache_config: spec.cache_config.as_ref(),
-            })
-        } else {
-            // Slow path: recursive matching with backtracking
-            let mut param_count = 0usize;
-            let spec = tree.match_path_recursive(segments, &mut param_buf, &mut param_count)?;
-            let param_values = param_buf[..param_count].to_vec();
-            Some(MatchedRoute {
-                handler_id: spec.handler_id,
-                param_values,
-                param_names: spec.param_names.as_ref(),
-                header_keys: spec.header_keys.as_ref(),
-                full_headers: spec.full_headers,
-                needs_path: spec.needs_path,
-                needs_url: spec.needs_url,
-                needs_query: spec.needs_query,
-                fast_path: spec.fast_path.as_ref(),
-                cache_config: spec.cache_config.as_ref(),
-            })
-        }
-    }
-
-    /// Fallback for paths with >MAX_STACK_SEGMENTS segments (heap-allocated)
-    fn match_radix_heap<'a, 'b>(
-        &'a self,
-        tree: &'a RadixNode,
-        segments: &[&'b str],
-    ) -> Option<MatchedRoute<'a, 'b>> {
-        let mut param_buf = [""; MAX_STACK_PARAMS];
-        if tree.is_fully_unambiguous() {
-            let (spec, param_count) = tree.match_path_iterative(segments, &mut param_buf)?;
-            let param_values = param_buf[..param_count].to_vec();
-            Some(MatchedRoute {
-                handler_id: spec.handler_id,
-                param_values,
-                param_names: spec.param_names.as_ref(),
-                header_keys: spec.header_keys.as_ref(),
-                full_headers: spec.full_headers,
-                needs_path: spec.needs_path,
-                needs_url: spec.needs_url,
-                needs_query: spec.needs_query,
-                fast_path: spec.fast_path.as_ref(),
-                cache_config: spec.cache_config.as_ref(),
-            })
-        } else {
-            let mut param_count = 0usize;
-            let spec = tree.match_path_recursive(segments, &mut param_buf, &mut param_count)?;
-            let param_values = param_buf[..param_count].to_vec();
-            Some(MatchedRoute {
-                handler_id: spec.handler_id,
-                param_values,
-                param_names: spec.param_names.as_ref(),
-                header_keys: spec.header_keys.as_ref(),
-                full_headers: spec.full_headers,
-                needs_path: spec.needs_path,
-                needs_url: spec.needs_url,
-                needs_query: spec.needs_query,
-                fast_path: spec.fast_path.as_ref(),
-                cache_config: spec.cache_config.as_ref(),
-            })
-        }
+        Some(MatchedRoute {
+            handler_id: spec.handler_id,
+            cache_namespace: spec.cache_namespace,
+            param_values,
+            param_names: spec.param_names.as_ref(),
+            header_keys: spec.header_keys.as_ref(),
+            full_headers: spec.full_headers,
+            needs_path: spec.needs_path,
+            needs_url: spec.needs_url,
+            needs_query: spec.needs_query,
+            fast_path: spec.fast_path.as_ref(),
+            cache_config: spec.cache_config.as_ref(),
+        })
     }
 
     pub fn exact_static_route(&self, method: &[u8], path: &[u8]) -> Option<&ExactStaticRoute> {
@@ -585,9 +350,9 @@ impl Router {
             return self.exact_get_root.as_ref();
         }
 
-        let midx = method_index_from_bytes(method)?;
-        self.exact_static_routes[midx]
-            .as_ref()
+        let method_key = MethodKey::from_method_bytes(method)?;
+        self.exact_static_routes
+            .get(&method_key)
             .and_then(|routes| routes.get(path))
     }
 
@@ -598,14 +363,70 @@ impl Router {
     pub fn match_ws_route(&self, path: &str) -> Option<u32> {
         self.ws_routes.get(path).copied()
     }
+
+    pub fn cache_namespaces(&self) -> HashSet<u64> {
+        let mut namespaces = HashSet::new();
+
+        for routes in self.dynamic_exact_routes.values() {
+            for route in routes.values() {
+                namespaces.insert(route.cache_namespace);
+            }
+        }
+
+        for tree in self.radix_trees.values() {
+            collect_radix_cache_namespaces(tree, &mut namespaces);
+        }
+
+        namespaces
+    }
+}
+
+// ─── MethodKey ──────────────────────────
+
+impl MethodKey {
+    fn from_method_str(method: &str) -> Option<Self> {
+        match method {
+            "DELETE" => Some(Self::Delete),
+            "GET" => Some(Self::Get),
+            "HEAD" => Some(Self::Head),
+            "OPTIONS" => Some(Self::Options),
+            "PATCH" => Some(Self::Patch),
+            "POST" => Some(Self::Post),
+            "PUT" => Some(Self::Put),
+            _ => None,
+        }
+    }
+
+    fn from_method_bytes(method: &[u8]) -> Option<Self> {
+        match method {
+            b"DELETE" => Some(Self::Delete),
+            b"GET" => Some(Self::Get),
+            b"HEAD" => Some(Self::Head),
+            b"OPTIONS" => Some(Self::Options),
+            b"PATCH" => Some(Self::Patch),
+            b"POST" => Some(Self::Post),
+            b"PUT" => Some(Self::Put),
+            _ => None,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Get),
+            2 => Some(Self::Post),
+            3 => Some(Self::Put),
+            4 => Some(Self::Delete),
+            5 => Some(Self::Patch),
+            6 => Some(Self::Options),
+            7 => Some(Self::Head),
+            _ => None,
+        }
+    }
 }
 
 // ─── Helpers ────────────────────────────
 
-fn compile_dynamic_route_spec(
-    route: &RouteInput,
-    middlewares: &[MiddlewareInput],
-) -> DynamicRouteSpec {
+fn compile_dynamic_route_spec(route: &RouteInput, middlewares: &[MiddlewareInput]) -> DynamicRouteSpec {
     let param_names = route
         .param_names
         .iter()
@@ -620,17 +441,12 @@ fn compile_dynamic_route_spec(
         .into_boxed_slice();
 
     let cache_config = route.cache.as_ref().map(|cache_in| {
-        let vary_keys = cache_in
-            .vary_by
-            .iter()
-            .map(|v| match v.source.as_str() {
-                "query" => CacheVaryKey::QueryParam(v.name.clone().into_boxed_str()),
-                "params" => CacheVaryKey::PathParam(v.name.clone().into_boxed_str()),
-                "headers" | "header" => CacheVaryKey::Header(v.name.clone().into_boxed_str()),
-                _ => CacheVaryKey::QueryParam(v.name.clone().into_boxed_str()),
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        let vary_keys = cache_in.vary_by.iter().map(|v| match v.source.as_str() {
+            "query" => CacheVaryKey::QueryParam(v.name.clone().into_boxed_str()),
+            "params" => CacheVaryKey::PathParam(v.name.clone().into_boxed_str()),
+            "headers" | "header" => CacheVaryKey::Header(v.name.clone().into_boxed_str()),
+            _ => CacheVaryKey::QueryParam(v.name.clone().into_boxed_str()),
+        }).collect::<Vec<_>>().into_boxed_slice();
 
         RouteCacheConfig {
             ttl_secs: cache_in.ttl_secs,
@@ -641,6 +457,7 @@ fn compile_dynamic_route_spec(
 
     DynamicRouteSpec {
         handler_id: route.handler_id,
+        cache_namespace: hash_cache_namespace(route.cache_namespace.as_str()),
         param_names,
         header_keys,
         full_headers: route.full_headers,
@@ -649,6 +466,26 @@ fn compile_dynamic_route_spec(
         needs_query: route.needs_query,
         fast_path: analyze_dynamic_fast_path(route, middlewares),
         cache_config,
+    }
+}
+
+fn hash_cache_namespace(value: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn collect_radix_cache_namespaces(node: &RadixNode, output: &mut HashSet<u64>) {
+    if let Some(handler) = node.handler.as_ref() {
+        output.insert(handler.cache_namespace);
+    }
+
+    if let Some(param_child) = node.param_child.as_ref() {
+        collect_radix_cache_namespaces(&param_child.node, output);
+    }
+
+    for child in &node.children {
+        collect_radix_cache_namespaces(&child.node, output);
     }
 }
 
@@ -663,38 +500,23 @@ fn split_request_segments(path: &str) -> Vec<&str> {
         .collect()
 }
 
-/// SIMD-accelerated segment splitting using memchr — avoids iterator overhead.
-/// Stack-allocated: writes segments into `buf`. Returns segment count.
-/// If the path has more segments than `buf.len()`, returns `buf.len() + 1` as overflow sentinel.
-#[inline]
+/// Stack-allocated segment splitting — avoids heap Vec for paths with ≤ MAX_STACK_SEGMENTS segments.
+/// Returns the number of segments written into `buf`. If the path has more segments than `buf.len()`,
+/// returns `buf.len() + 1` as an overflow sentinel.
 fn split_segments_stack<'a>(path: &'a str, buf: &mut [&'a str]) -> usize {
-    let bytes = path.as_bytes();
-    let len = bytes.len();
-    if len <= 1 {
-        // "/" or empty
+    if path == "/" {
         return 0;
     }
-
-    let start = if bytes[0] == b'/' { 1 } else { 0 };
-    let mut pos = start;
     let mut count = 0;
-
-    while pos < len {
-        // Use memchr for SIMD-accelerated slash finding
-        let next = memchr::memchr(b'/', &bytes[pos..])
-            .map(|i| pos + i)
-            .unwrap_or(len);
-
-        if next > pos {
-            if count >= buf.len() {
-                return count + 1; // overflow sentinel
-            }
-            // Safety: path is valid UTF-8, and we're splitting on ASCII '/'
-            // which cannot split a multi-byte UTF-8 sequence
-            buf[count] = unsafe { std::str::from_utf8_unchecked(&bytes[pos..next]) };
-            count += 1;
+    for segment in path.trim_start_matches('/').split('/') {
+        if segment.is_empty() {
+            continue;
         }
-        pos = next + 1;
+        if count >= buf.len() {
+            return count + 1; // overflow sentinel
+        }
+        buf[count] = segment;
+        count += 1;
     }
     count
 }
@@ -745,6 +567,8 @@ fn build_response_bytes(
     response.extend_from_slice(body);
     response
 }
+
+// Todo: Are these expensive? if so remove them.
 
 fn status_reason(status: u16) -> &'static str {
     match status {
@@ -867,7 +691,7 @@ impl RouteCache {
         self.map.insert(key, new_idx);
         self.push_head(new_idx);
     }
-
+    
     #[allow(dead_code)]
     pub fn invalidate(&mut self, key: u64) {
         if let Some(&idx) = self.map.get(&key) {
@@ -921,15 +745,38 @@ impl RouteCache {
 }
 
 use std::cell::RefCell;
+use std::cell::Cell;
 
 thread_local! {
-    static ROUTE_CACHES: RefCell<HashMap<u32, RouteCache>> = RefCell::new(HashMap::new());
+    static ROUTE_CACHES: RefCell<HashMap<u64, RouteCache>> = RefCell::new(HashMap::new());
+    static ROUTE_CACHE_SYNC_GENERATION: Cell<u64> = Cell::new(0);
 }
 
-pub fn get_cached_response(handler_id: u32, key: u64, keep_alive: bool) -> Option<Bytes> {
+fn sync_route_caches() {
+    let generation = crate::CACHE_NAMESPACE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+
+    ROUTE_CACHE_SYNC_GENERATION.with(|seen_generation| {
+        if seen_generation.get() == generation {
+            return;
+        }
+
+        let valid_namespaces = crate::cache_namespace_counts();
+        ROUTE_CACHES.with(|caches| {
+            caches
+                .borrow_mut()
+                .retain(|cache_namespace, _| valid_namespaces.contains_key(cache_namespace));
+        });
+
+        seen_generation.set(generation);
+    });
+}
+
+pub fn get_cached_response(cache_namespace: u64, key: u64, keep_alive: bool) -> Option<Bytes> {
+    sync_route_caches();
+
     ROUTE_CACHES.with(|caches| {
         let mut caches = caches.borrow_mut();
-        if let Some(cache) = caches.get_mut(&handler_id) {
+        if let Some(cache) = caches.get_mut(&cache_namespace) {
             if let Some(entry) = cache.get(key, Instant::now()) {
                 return Some(if keep_alive {
                     entry.response_bytes.clone()
@@ -942,12 +789,15 @@ pub fn get_cached_response(handler_id: u32, key: u64, keep_alive: bool) -> Optio
     })
 }
 
-pub fn insert_cached_response(handler_id: u32, key: u64, entry: CacheEntry, max_entries: usize) {
+pub fn insert_cached_response(cache_namespace: u64, key: u64, entry: CacheEntry, max_entries: usize) {
+    sync_route_caches();
+
     ROUTE_CACHES.with(|caches| {
         let mut caches = caches.borrow_mut();
         let cache = caches
-            .entry(handler_id)
+            .entry(cache_namespace)
             .or_insert_with(|| RouteCache::new(max_entries));
+        cache.max_entries = max_entries.max(1);
         cache.insert(key, entry);
     });
 }
@@ -959,11 +809,8 @@ pub fn interpolate_cache_key(
     param_names: &[Box<str>],
     param_values: &[&str],
 ) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
     let mut hasher = DefaultHasher::new();
-
+    
     for vary_key in config.vary_keys.iter() {
         match vary_key {
             CacheVaryKey::QueryParam(name) => {
@@ -1024,6 +871,6 @@ pub fn interpolate_cache_key(
             }
         }
     }
-
+    
     hasher.finish()
 }

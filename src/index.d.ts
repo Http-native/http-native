@@ -174,11 +174,11 @@ export interface RuntimeOptimizationOptions {
   timing?: boolean;
   /** Enable runtime response cache promotion for deterministic routes */
   cache?: boolean;
-  /** Restart process on JS/Rust source changes (dev only, default: false) */
+  /** Restart the current runtime process on source changes (Node and Bun) */
   hotReload?: boolean;
-  /** Watch roots for hot reload (default: ["src", "rsrc/src", ".github/tests"]) */
+  /** Override watched roots for runtime hot reload */
   hotReloadPaths?: string[];
-  /** Debounce window for restart triggers in ms (default: 120) */
+  /** Debounce window for runtime hot reload triggers in ms */
   hotReloadDebounceMs?: number;
   /** Write dev comments above route declarations with optimization flags (default: true) */
   devComments?: boolean;
@@ -199,6 +199,28 @@ export interface ListenOptions {
 
   /** Runtime optimization options */
   opt?: RuntimeOptimizationOptions;
+}
+
+export interface ReloadOptions {
+  /** Files or directories to watch for reload */
+  watch?: string[];
+  /** Alias of watch for app-level reload configuration */
+  files?: string[];
+  /** Debounce window before a reload is applied */
+  debounceMs?: number;
+  /** Clear the console after successful reloads */
+  clear?: boolean;
+}
+
+export interface HotReloadOptions {
+  /** Files or directories to watch for runtime process respawn */
+  paths?: string[];
+  /** Alias of paths for compatibility */
+  hotReloadPaths?: string[];
+  /** Debounce window before process respawn */
+  debounceMs?: number;
+  /** Alias of debounceMs for compatibility */
+  hotReloadDebounceMs?: number;
 }
 
 // ─── Server Handle ──────────────────────
@@ -225,7 +247,7 @@ export interface ServerHandle {
   };
 
   /** Gracefully close the server */
-  close(): void;
+  close(): Promise<void>;
 }
 
 export interface ListenHandle extends Promise<ServerHandle> {
@@ -247,6 +269,9 @@ export interface ListenHandle extends Promise<ServerHandle> {
    * await app.listen().port(443).tls({ cert: "./cert.pem", key: "./key.pem" })
    */
   tls(config: TlsConfig): ListenHandle;
+
+  /** Enable runtime hot reload respawn for self-starting apps */
+  hot(options?: boolean | HotReloadOptions): ListenHandle;
 }
 
 export interface OptimizationSnapshot {
@@ -345,6 +370,9 @@ export interface Application {
 
   /** Register a handler for all HTTP methods */
   all(path: string, handler: RouteHandler): Application;
+
+  /** Configure first-class app reload behavior for dev runtimes */
+  reload(options?: ReloadOptions): Application;
 
   /** Start the server and listen for connections */
   listen(options?: ListenOptions): ListenHandle;

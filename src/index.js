@@ -21,7 +21,7 @@ import defaultHttpServerConfig, {
 } from "./http-server.config.js";
 import { buildRouteEntry } from "./opt/entry.js";
 import { createRouteDevCommentWriter } from "./dev/comments.js";
-import { createHotReloadController } from "./dev/hot-reload.js";
+import { createRuntimeHotReloadController } from "./dev/hot-reload.js";
 import { createRuntimeOptimizer } from "./opt/runtime.js";
 
 const HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"];
@@ -533,20 +533,37 @@ function isPromiseLike(value) {
 
 // ─── Dispatcher ─────────────────────────
 
-function createDispatcher(
-  compiledRoutes,
-  runtimeOptimizer,
-  errorHandlers = [],
-  devRouteCommentWriter = null,
-  wsRoutes = [],
-) {
-  const routesById = new Map(compiledRoutes.map((route) => [route.handlerId, route]));
-  const wsRoutesById = new Map(wsRoutes.map((r) => [r.handlerId, r]));
-  const errorRequestFactory = createRequestFactory(ERROR_REQUEST_PLAN, [], null);
-  const trackDispatchTiming =
-    runtimeOptimizer?.shouldCaptureDispatchTiming?.() === true;
+function buildDispatchState(snapshot) {
+  return {
+    snapshot,
+    ...snapshot,
+    routesById: new Map(snapshot.compiledRoutes.map((route) => [route.handlerId, route])),
+    wsRoutesById: new Map(snapshot.wsRoutes.map((route) => [route.handlerId, route])),
+    trackDispatchTiming:
+      snapshot.runtimeOptimizer?.shouldCaptureDispatchTiming?.() === true,
+  };
+}
 
-  async function finalizeError(error, req, res, snapshot, release, fallbackStatus = 500) {
+function disposeCompiledSnapshot(snapshot) {
+  snapshot?.runtimeOptimizer?.dispose?.();
+  snapshot?.devRouteCommentWriter?.cleanup?.();
+  snapshot?.detachDevCommentProcessCleanup?.();
+}
+
+function createDispatcher(initialSnapshot) {
+  let currentState = buildDispatchState(initialSnapshot);
+  const errorRequestFactory = createRequestFactory(ERROR_REQUEST_PLAN, [], null);
+  const activeWebSocketIds = new Set();
+
+  async function finalizeError(
+    errorHandlers,
+    error,
+    req,
+    res,
+    snapshot,
+    release,
+    fallbackStatus = 500,
+  ) {
     try {
       if (!res.finished) {
         for (const errorHandler of errorHandlers) {
@@ -575,7 +592,9 @@ function createDispatcher(
     }
   }
 
-  return async function dispatch(requestBuffer) {
+  const dispatch = async (requestBuffer) => {
+    const state = currentState;
+
     // WebSocket event dispatch (sentinel 0xFE)
     if (requestBuffer[0] === 0xFE) {
       const eventType = requestBuffer[1];
@@ -584,7 +603,7 @@ function createDispatcher(
       const dataLen = requestBuffer.readUInt32LE(14);
       const data = dataLen > 0 ? requestBuffer.subarray(18, 18 + dataLen) : null;
 
-      const route = wsRoutesById.get(handlerId);
+      const route = state.wsRoutesById.get(handlerId);
       if (!route) return EMPTY_BUFFER;
 
       const native = loadNativeModule();
@@ -601,13 +620,19 @@ function createDispatcher(
 
       try {
         switch (eventType) {
-          case 0x01: await route.handlers.open?.(ws); break;
+          case 0x01:
+            activeWebSocketIds.add(wsId);
+            await route.handlers.open?.(ws);
+            break;
           case 0x02: {
             const textData = data ? new TextDecoder().decode(data) : "";
             await route.handlers.message?.(ws, textData);
             break;
           }
-          case 0x03: await route.handlers.close?.(ws); break;
+          case 0x03:
+            activeWebSocketIds.delete(wsId);
+            await route.handlers.close?.(ws);
+            break;
         }
       } catch (err) {
         console.error("[http-native] WebSocket handler error:", err);
@@ -628,6 +653,7 @@ function createDispatcher(
       const req = errorRequestFactory(decoded);
       const { response: res, snapshot, release } = createResponseEnvelope();
       return finalizeError(
+        state.errorHandlers,
         createHttpError(404, "Route not found", "NOT_FOUND"),
         req,
         res,
@@ -637,7 +663,7 @@ function createDispatcher(
       );
     }
 
-    const route = routesById.get(decoded.handlerId);
+    const route = state.routesById.get(decoded.handlerId);
     if (!route) {
       return serializeErrorResponse(new Error(`Unknown handler id ${decoded.handlerId}`));
     }
@@ -649,7 +675,7 @@ function createDispatcher(
 
     const req = route.requestFactory(decoded);
     const { response: res, snapshot, release } = createResponseEnvelope(route.jsonSerializer);
-    const dispatchStartMs = trackDispatchTiming ? performance.now() : 0;
+    const dispatchStartMs = state.trackDispatchTiming ? performance.now() : 0;
 
     try {
       // Fast path: skip middleware runner entirely when no middlewares are attached
@@ -668,7 +694,7 @@ function createDispatcher(
         }
       }
     } catch (error) {
-      return finalizeError(error, req, res, snapshot, release, 500);
+      return finalizeError(state.errorHandlers, error, req, res, snapshot, release, 500);
     }
 
     const responseSnapshot = snapshot();
@@ -681,10 +707,10 @@ function createDispatcher(
       return streamEnvelope;
     }
 
-    const dispatchDurationMs = trackDispatchTiming
+    const dispatchDurationMs = state.trackDispatchTiming
       ? performance.now() - dispatchStartMs
       : undefined;
-    runtimeOptimizer?.recordDispatch(route, req, responseSnapshot, dispatchDurationMs);
+    state.runtimeOptimizer?.recordDispatch(route, req, responseSnapshot, dispatchDurationMs);
     let encoded = encodeResponseEnvelope(responseSnapshot);
 
     // Append session trailer if session mutations exist
@@ -697,12 +723,41 @@ function createDispatcher(
       route,
       responseSnapshot,
       encoded,
-      devRouteCommentWriter,
+      state.devRouteCommentWriter,
     );
     releaseRequestObject(req);
     release();
     return encoded;
   };
+
+  dispatch.current = () => currentState.snapshot;
+  dispatch.replace = (nextSnapshot) => {
+    const previousState = currentState;
+    currentState = buildDispatchState(nextSnapshot);
+    return previousState.snapshot;
+  };
+  dispatch.restore = (snapshot) => {
+    currentState = buildDispatchState(snapshot);
+  };
+  dispatch.closeWebSockets = () => {
+    if (activeWebSocketIds.size === 0) {
+      return;
+    }
+
+    const native = loadNativeModule();
+    for (const wsId of activeWebSocketIds) {
+      try {
+        native.streamEnd(Number(wsId));
+      } catch {}
+    }
+    activeWebSocketIds.clear();
+  };
+  dispatch.dispose = () => {
+    dispatch.closeWebSockets();
+    disposeCompiledSnapshot(currentState.snapshot);
+  };
+
+  return dispatch;
 }
 
 // ─── Route Registration & Compilation ───
@@ -1158,13 +1213,19 @@ function createMethodRegistrar(app, method) {
     if (method === "ALL") {
       for (const concreteMethod of HTTP_METHODS) {
         app._routes.push(
-          normalizeRouteRegistration(concreteMethod, scopedPath, handler, routeOptions),
+          {
+            ...normalizeRouteRegistration(concreteMethod, scopedPath, handler, routeOptions),
+            handlerId: app._allocateHandlerId(),
+          },
         );
       }
       return app;
     }
 
-    app._routes.push(normalizeRouteRegistration(method, scopedPath, handler, routeOptions));
+    app._routes.push({
+      ...normalizeRouteRegistration(method, scopedPath, handler, routeOptions),
+      handlerId: app._allocateHandlerId(),
+    });
     return app;
   };
 }
@@ -1173,7 +1234,6 @@ function normalizeListenOptions(options = {}) {
   const serverConfig = normalizeHttpServerConfig(
     options.serverConfig ?? options.httpServerConfig ?? defaultHttpServerConfig,
   );
-  const hasHotRuntimeContext = Boolean(globalThis.__HTTP_NATIVE_HOT__);
   const optionOpt = options.opt ?? null;
   const normalizedOpt = {
     notify: optionOpt?.notify ?? true,
@@ -1190,9 +1250,10 @@ function normalizeListenOptions(options = {}) {
       optionOpt?.devComments ?? process.env.HTTP_NATIVE_DEV_COMMENTS !== "0",
   };
 
-  if (normalizedOpt.hotReload || hasHotRuntimeContext) {
+  if (globalThis.__HTTP_NATIVE_DEV_CONTEXT__) {
     // Avoid auto-generated source edits causing restart loops in dev hot-reload mode.
     normalizedOpt.devComments = false;
+    normalizedOpt.hotReload = false;
   }
 
   return {
@@ -1255,6 +1316,292 @@ async function closeNativeServerHandle(handle, timeoutMs = NATIVE_CLOSE_TIMEOUT_
   return completed;
 }
 
+async function assertPortAvailable(host, port) {
+  if (!Number.isFinite(port) || Number(port) === 0) {
+    return;
+  }
+
+  await new Promise((resolve, reject) => {
+    import("node:net").then(({ createServer }) => {
+      const tester = createServer();
+      tester.once("error", (error) => {
+        if (error.code === "EADDRINUSE") {
+          reject(new Error(`Port ${port} is already in use`));
+          return;
+        }
+        reject(error);
+      });
+      tester.once("listening", () => tester.close(resolve));
+      tester.listen(port, host);
+    });
+  });
+}
+
+function buildRouteCacheNamespace(route) {
+  let hash = fnv1aString(0x811c9dc5, route.method);
+  hash = fnv1aString(hash, route.path);
+  hash = fnv1aString(hash, route.handlerSource ?? "");
+
+  for (const middleware of route.applicableMiddlewares ?? []) {
+    hash = fnv1aString(hash, middleware.pathPrefix ?? "/");
+    hash = fnv1aString(hash, middleware.handlerSource ?? "");
+  }
+
+  const cache = route.cache ?? null;
+  if (cache) {
+    hash = fnv1aString(hash, String(cache.ttl ?? 60));
+    hash = fnv1aString(hash, String(cache.maxEntries ?? 256));
+    for (const varyKey of cache.varyBy ?? []) {
+      hash = fnv1aString(hash, String(varyKey));
+    }
+  }
+
+  return `route:${hash.toString(16)}`;
+}
+
+function normalizeApplicationReloadConfig(options = {}) {
+  if (options === false || options == null) {
+    return null;
+  }
+
+  if (typeof options !== "object") {
+    throw new TypeError("app.reload(options) expects an object");
+  }
+
+  const watch = Array.isArray(options.watch)
+    ? options.watch
+    : Array.isArray(options.files)
+      ? options.files
+      : undefined;
+
+  return {
+    ...(watch ? { watch: [...watch] } : {}),
+    ...(options.debounceMs === undefined ? {} : { debounceMs: Number(options.debounceMs) }),
+    ...(options.clear === undefined ? {} : { clear: Boolean(options.clear) }),
+  };
+}
+
+function normalizeManifestCache(cache) {
+  if (!cache) {
+    return null;
+  }
+
+  return {
+    ttlSecs: cache.ttl || 60,
+    maxEntries: cache.maxEntries || 256,
+    varyBy: (cache.varyBy || []).map((key) => {
+      const dotIndex = key.indexOf(".");
+      return dotIndex >= 0
+        ? { source: key.slice(0, dotIndex), name: key.slice(dotIndex + 1) }
+        : { source: "query", name: key };
+    }),
+  };
+}
+
+function buildCompiledApplication(app, normalizedOptions) {
+  const compiledMiddlewares = app._middlewares.map(compileMiddlewareRegistration);
+  const errorHandlerPlans = app._errorHandlers.map((handler) =>
+    analyzeRequestAccess(Function.prototype.toString.call(handler)),
+  );
+
+  const routes = app._routes.map((route) => {
+    let handlerSource = Function.prototype.toString.call(route.handler);
+    const probedSource = probeHandlerForFastPath(route, handlerSource);
+    if (probedSource) {
+      handlerSource = probedSource;
+    }
+
+    return {
+      ...route,
+      handlerSource,
+      accessPlan: analyzeRequestAccess(handlerSource),
+      ...compileRouteShape(route.method, route.path),
+    };
+  });
+  const compiledRoutes = routes.map((route) =>
+    compileRouteDispatch(
+      route,
+      compiledMiddlewares,
+      errorHandlerPlans,
+      normalizedOptions.opt,
+    ),
+  );
+  for (const route of compiledRoutes) {
+    route.cacheNamespace = buildRouteCacheNamespace(route);
+  }
+
+  const manifest = {
+    version: 1,
+    serverConfig: normalizedOptions.serverConfig,
+    middlewares: compiledMiddlewares.map((middleware) => ({
+      pathPrefix: middleware.pathPrefix,
+    })),
+    routes: compiledRoutes.map((route) => ({
+      method: route.method,
+      methodCode: route.methodCode,
+      path: route.path,
+      routeKind: route.routeKind,
+      handlerId: route.handlerId,
+      cacheNamespace: route.cacheNamespace,
+      handlerSource: route.handlerSource,
+      paramNames: route.paramNames,
+      segmentCount: route.segmentCount,
+      headerKeys: [...route.requestPlan.headerKeys],
+      fullHeaders: route.requestPlan.fullHeaders,
+      needsPath: route.requestPlan.path,
+      needsUrl: route.requestPlan.url,
+      needsQuery:
+        route.requestPlan.fullQuery ||
+        route.requestPlan.queryKeys.size > 0,
+      cache: normalizeManifestCache(route.cache),
+      needsSession: /\breq\.session\b|\breq\.sessionId\b/.test(route.handlerSource),
+    })),
+    wsRoutes: app._wsRoutes.map((ws) => ({
+      path: ws.path,
+      handlerId: ws.handlerId,
+    })),
+  };
+
+  if (normalizedOptions.tls) {
+    manifest.tls = {
+      cert: normalizedOptions.tls.cert,
+      key: normalizedOptions.tls.key,
+      ca: normalizedOptions.tls.ca,
+      passphrase: normalizedOptions.tls.passphrase,
+    };
+  }
+
+  const sessionMiddleware = app._middlewares.find((middleware) => middleware.handler._sessionConfig);
+  if (sessionMiddleware) {
+    const cfg = sessionMiddleware.handler._sessionConfig;
+    manifest.session = {
+      secret: cfg.secret,
+      maxAgeSecs: cfg.maxAge,
+      cookieName: cfg.cookieName,
+      httpOnly: cfg.httpOnly,
+      secure: cfg.secure,
+      sameSite: cfg.sameSite,
+      path: cfg.path,
+      maxSessions: cfg.maxSessions,
+      maxDataSize: cfg.maxDataSize,
+    };
+  }
+
+  const runtimeOptimizer = createRuntimeOptimizer(
+    compiledRoutes,
+    compiledMiddlewares,
+    normalizedOptions.opt,
+  );
+  const devRouteCommentWriter = createRouteDevCommentWriter(normalizedOptions.opt);
+  const detachDevCommentProcessCleanup = registerDevCommentProcessCleanup(
+    devRouteCommentWriter,
+  );
+  if (devRouteCommentWriter) {
+    for (const route of compiledRoutes) {
+      const routeEntry = buildRouteEntry(route, compiledMiddlewares);
+      const baseStatus =
+        routeEntry.nativeCache === true
+          ? "native-cache"
+          : routeEntry.staticFastPath === true
+            ? "static-fast-path"
+            : "bridge-dispatch";
+      devRouteCommentWriter.markRoute(route, baseStatus);
+
+      if (route.runtimeResponseCache) {
+        devRouteCommentWriter.markRoute(route, "runtime-cache-tracking");
+      }
+    }
+  }
+
+  return {
+    compiledRoutes,
+    compiledMiddlewares,
+    runtimeOptimizer,
+    devRouteCommentWriter,
+    detachDevCommentProcessCleanup,
+    errorHandlers: app._errorHandlers,
+    wsRoutes: app._wsRoutes,
+    manifestJson: JSON.stringify(manifest),
+    normalizedOptions,
+  };
+}
+
+async function startCompiledServer(compiledSnapshot, normalizedOptions) {
+  await assertPortAvailable(normalizedOptions.host, normalizedOptions.port);
+
+  const native = loadNativeModule();
+  const dispatcher = createDispatcher(compiledSnapshot);
+  const nativeHandle = native.startServer(compiledSnapshot.manifestJson, dispatcher, {
+    host: normalizedOptions.host,
+    port: normalizedOptions.port,
+    backlog: normalizedOptions.backlog,
+  });
+  ACTIVE_NATIVE_SERVERS.add(nativeHandle);
+
+  let closing = false;
+  const closeServerHandle = async () => {
+    if (closing) {
+      return;
+    }
+    closing = true;
+    dispatcher.dispose();
+    ACTIVE_NATIVE_SERVERS.delete(nativeHandle);
+    const closed = await closeNativeServerHandle(nativeHandle);
+    if (!closed && process.env.NODE_ENV !== "production") {
+      console.warn(
+        `[http-native] native server close timed out after ${NATIVE_CLOSE_TIMEOUT_MS}ms; continuing shutdown`,
+      );
+    }
+  };
+
+  const hotReloadController = createRuntimeHotReloadController({
+    enabled: normalizedOptions.opt.hotReload === true,
+    roots: normalizedOptions.opt.hotReloadPaths,
+    debounceMs: normalizedOptions.opt.hotReloadDebounceMs,
+    beforeRestart: async () => {
+      await closeServerHandle();
+    },
+  });
+
+  const serverHandle = {
+    host: nativeHandle.host,
+    port: nativeHandle.port,
+    url: normalizedOptions.tls ? nativeHandle.url.replace("http://", "https://") : nativeHandle.url,
+    tls: !!normalizedOptions.tls,
+    _handle: nativeHandle,
+    _dispatcher: dispatcher,
+    _reloadCompiledSnapshot(nextSnapshot) {
+      const previousSnapshot = dispatcher.replace(nextSnapshot);
+
+      try {
+        dispatcher.closeWebSockets();
+        nativeHandle.reload(nextSnapshot.manifestJson);
+        disposeCompiledSnapshot(previousSnapshot);
+      } catch (error) {
+        dispatcher.restore(previousSnapshot);
+        disposeCompiledSnapshot(nextSnapshot);
+        throw error;
+      }
+
+      return this;
+    },
+    optimizations: {
+      snapshot() {
+        return dispatcher.current().runtimeOptimizer.snapshot();
+      },
+      summary() {
+        return dispatcher.current().runtimeOptimizer.summary();
+      },
+    },
+    close() {
+      hotReloadController.dispose();
+      return closeServerHandle();
+    },
+  };
+
+  return serverHandle;
+}
+
 // ─── Application Factory ───────────────
 
 /**
@@ -1264,7 +1611,6 @@ async function closeNativeServerHandle(handle, timeoutMs = NATIVE_CLOSE_TIMEOUT_
  * @returns {import('./index').Application}
  */
 export function createApp(config = {}) {
-  const native = loadNativeModule();
   let nextHandlerId = 1;
 
   // Consolidate top-level config into a normalized shape that listen() can use as defaults.
@@ -1303,6 +1649,10 @@ export function createApp(config = {}) {
     _wsRoutes: [],
     _groupPrefix: "/",
     _config: appConfig,
+    _reloadConfig: null,
+    _allocateHandlerId() {
+      return nextHandlerId++;
+    },
 
     use(pathOrMiddleware, maybeMiddleware) {
       let pathPrefix = "/";
@@ -1393,6 +1743,11 @@ export function createApp(config = {}) {
     options: undefined,
     all: undefined,
 
+    reload(options = {}) {
+      this._reloadConfig = normalizeApplicationReloadConfig(options);
+      return this;
+    },
+
     listen(options = {}) {
       const startServer = async (listenOptions = options) => {
         // Merge app-level defaults (from createApp config) with per-listen overrides.
@@ -1411,222 +1766,22 @@ export function createApp(config = {}) {
           },
         };
         const normalizedOptions = normalizeListenOptions(mergedOptions);
-
-        await new Promise((resolve, reject) => {
-          import("node:net").then(({ createServer }) => {
-            const tester = createServer();
-            tester.once("error", (err) => {
-              if (err.code === "EADDRINUSE") {
-                reject(new Error(`Port ${normalizedOptions.port} is already in use`));
-              } else {
-                reject(err);
-              }
-            });
-            tester.once("listening", () => tester.close(resolve));
-            tester.listen(normalizedOptions.port, normalizedOptions.host);
-          });
-        });
-        const compiledMiddlewares = this._middlewares.map(compileMiddlewareRegistration);
-        const errorHandlerPlans = this._errorHandlers.map((handler) =>
-          analyzeRequestAccess(Function.prototype.toString.call(handler)),
-        );
-
-        const routes = this._routes.map((route) => {
-          let handlerSource = Function.prototype.toString.call(route.handler);
-
-          // ── Fast-path probe: try to pre-evaluate the handler to resolve
-          // closure variables that block the Rust dynamic fast-path analyzer.
-          // If the handler is a simple res.json({...}) with closure variables,
-          // we call it with probe params and capture the response to generate
-          // a synthetic handler source with resolved literal values.
-          const probed = probeHandlerForFastPath(route, handlerSource);
-          if (probed) {
-            handlerSource = probed;
-          }
-
-          return {
-            ...route,
-            handlerId: nextHandlerId++,
-            handlerSource,
-            accessPlan: analyzeRequestAccess(handlerSource),
-            ...compileRouteShape(route.method, route.path),
-          };
-        });
-        const compiledRoutes = routes.map((route) =>
-          compileRouteDispatch(
-            route,
-            compiledMiddlewares,
-            errorHandlerPlans,
-            normalizedOptions.opt,
-          ),
-        );
-
-        const manifest = {
-          version: 1,
-          serverConfig: normalizedOptions.serverConfig,
-          middlewares: compiledMiddlewares.map((middleware) => ({
-            pathPrefix: middleware.pathPrefix,
-          })),
-          routes: compiledRoutes.map((route) => ({
-            method: route.method,
-            methodCode: route.methodCode,
-            path: route.path,
-            routeKind: route.routeKind,
-            handlerId: route.handlerId,
-            handlerSource: route.handlerSource,
-            paramNames: route.paramNames,
-            segmentCount: route.segmentCount,
-            headerKeys: [...route.requestPlan.headerKeys],
-            fullHeaders: route.requestPlan.fullHeaders,
-            needsPath: route.requestPlan.path,
-            needsUrl: route.requestPlan.url,
-            needsQuery:
-              route.requestPlan.fullQuery ||
-              route.requestPlan.queryKeys.size > 0,
-            cache: route.cache
-              ? {
-                ttlSecs: route.cache.ttl || 60,
-                maxEntries: route.cache.maxEntries || 256,
-                varyBy: (route.cache.varyBy || []).map((key) => {
-                  const dotIndex = key.indexOf(".");
-                  return dotIndex >= 0
-                    ? { source: key.slice(0, dotIndex), name: key.slice(dotIndex + 1) }
-                    : { source: "query", name: key };
-                }),
-              }
-              : null,
-            needsSession: /\breq\.session\b|\breq\.sessionId\b/.test(route.handlerSource),
-          })),
-          wsRoutes: this._wsRoutes.map((ws) => ({
-            path: ws.path,
-            handlerId: ws.handlerId,
-          })),
-        };
-
-        if (normalizedOptions.tls) {
-          manifest.tls = {
-            cert: normalizedOptions.tls.cert,
-            key: normalizedOptions.tls.key,
-            ca: normalizedOptions.tls.ca,
-            passphrase: normalizedOptions.tls.passphrase,
-          };
-        }
-
-        // Detect session middleware and add config to manifest
-        const sessionMiddleware = this._middlewares.find((mw) => mw.handler._sessionConfig);
-        if (sessionMiddleware) {
-          const cfg = sessionMiddleware.handler._sessionConfig;
-          manifest.session = {
-            secret: cfg.secret,
-            maxAgeSecs: cfg.maxAge,
-            cookieName: cfg.cookieName,
-            httpOnly: cfg.httpOnly,
-            secure: cfg.secure,
-            sameSite: cfg.sameSite,
-            path: cfg.path,
-            maxSessions: cfg.maxSessions,
-            maxDataSize: cfg.maxDataSize,
-          };
-        }
-
-        const runtimeOptimizer = createRuntimeOptimizer(
-          compiledRoutes,
-          compiledMiddlewares,
-          normalizedOptions.opt,
-        );
-        const devRouteCommentWriter = createRouteDevCommentWriter(normalizedOptions.opt);
-        const detachDevCommentProcessCleanup = registerDevCommentProcessCleanup(
-          devRouteCommentWriter,
-        );
-        if (devRouteCommentWriter) {
-          for (const route of compiledRoutes) {
-            const routeEntry = buildRouteEntry(route, compiledMiddlewares);
-            const baseStatus =
-              routeEntry.nativeCache === true
-                ? "native-cache"
-                : routeEntry.staticFastPath === true
-                  ? "static-fast-path"
-                  : "bridge-dispatch";
-            devRouteCommentWriter.markRoute(route, baseStatus);
-
-            if (route.runtimeResponseCache) {
-              devRouteCommentWriter.markRoute(route, "runtime-cache-tracking");
-            }
-          }
-        }
-
-        const dispatcher = createDispatcher(
-          compiledRoutes,
-          runtimeOptimizer,
-          this._errorHandlers,
-          devRouteCommentWriter,
-          this._wsRoutes,
-        );
-        // Hot reload: override port/host if the hot reloader is active
-        const hotCtx = globalThis.__HTTP_NATIVE_HOT__;
-        const listenHost = hotCtx?.host ?? normalizedOptions.host;
-        const listenPort = hotCtx?.port ?? normalizedOptions.port;
-
-        const handle = native.startServer(JSON.stringify(manifest), dispatcher, {
-          host: listenHost,
-          port: listenPort,
-          backlog: normalizedOptions.backlog,
-        });
-        ACTIVE_NATIVE_SERVERS.add(handle);
-
-        let closing = false;
-        const closeServerHandle = async () => {
-          if (closing) {
-            return;
-          }
-          closing = true;
-          ACTIVE_NATIVE_SERVERS.delete(handle);
-          runtimeOptimizer?.dispose?.();
-          devRouteCommentWriter?.cleanup?.();
-          detachDevCommentProcessCleanup();
-          const closed = await closeNativeServerHandle(handle);
-          if (!closed && process.env.NODE_ENV !== "production") {
-            console.warn(
-              `[http-native] native server close timed out after ${NATIVE_CLOSE_TIMEOUT_MS}ms; continuing shutdown`,
-            );
-          }
-        };
-
-        const hotReloadController = createHotReloadController({
-          enabled: normalizedOptions.opt.hotReload === true,
-          roots: normalizedOptions.opt.hotReloadPaths,
-          debounceMs: normalizedOptions.opt.hotReloadDebounceMs,
-          beforeRestart: async () => {
-            await closeServerHandle();
+        const routes = this._routes.map((route) => ({
+          ...route,
+        }));
+        const wsRoutes = this._wsRoutes.map((route) => ({
+          ...route,
+        }));
+        const compiledApp = buildCompiledApplication(
+          {
+            ...this,
+            _routes: routes,
+            _wsRoutes: wsRoutes,
           },
-        });
+          normalizedOptions,
+        );
 
-        const serverHandle = {
-          host: handle.host,
-          port: handle.port,
-          url: normalizedOptions.tls ? handle.url.replace("http://", "https://") : handle.url,
-          tls: !!normalizedOptions.tls,
-          _handle: handle,
-          optimizations: {
-            snapshot() {
-              return runtimeOptimizer.snapshot();
-            },
-            summary() {
-              return runtimeOptimizer.summary();
-            },
-          },
-          close() {
-            hotReloadController?.dispose?.();
-            return closeServerHandle();
-          },
-        };
-
-        // Hot reload: capture the server handle so hot.js can manage it
-        if (hotCtx) {
-          hotCtx.server = serverHandle;
-        }
-
-        return serverHandle;
+        return startCompiledServer(compiledApp, normalizedOptions);
       };
 
       let selectedPort = options.port;
@@ -1648,7 +1803,11 @@ export function createApp(config = {}) {
 
       const start = () => {
         if (!startPromise) {
-          startPromise = startServer(resolveOptions());
+          const resolvedOptions = resolveOptions();
+          const devContext = globalThis.__HTTP_NATIVE_DEV_CONTEXT__;
+          startPromise = devContext?.registerAppListen
+            ? devContext.registerAppListen(this, resolvedOptions)
+            : startServer(resolvedOptions);
         }
         return startPromise;
       };
@@ -1750,7 +1909,7 @@ export function createApp(config = {}) {
     app._wsRoutes.push({
       path: normalizeRoutePath("GET", path),
       handlers,
-      handlerId: nextHandlerId++,
+      handlerId: app._allocateHandlerId(),
     });
     return app;
   };
@@ -1765,3 +1924,9 @@ export function createApp(config = {}) {
 
   return app;
 }
+
+export {
+  buildCompiledApplication as _buildCompiledApplication,
+  normalizeListenOptions as _normalizeListenOptions,
+  startCompiledServer as _startCompiledServer,
+};

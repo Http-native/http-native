@@ -9,7 +9,7 @@ A fast, Express-like HTTP framework for JavaScript powered by a Rust native modu
 ## Install
 
 ```sh
-npm install @http-native/core
+bun add @http-native/core
 ```
 
 ## Usage
@@ -51,4 +51,39 @@ const server = await app.listen().port(8190).opt({ devComments: true });
 
 console.log(server.optimizations.summary());
 console.log(server.optimizations.snapshot());
+```
+
+## Dev Reload
+
+```sh
+http-native dev ./server.js --port 3000
+```
+
+```js
+import { createDevServer } from "@http-native/core/dev";
+
+const dev = await createDevServer({
+  entry: "./server.js",
+  port: 3000,
+});
+
+console.log(dev.status());
+```
+
+You can define reload behavior on the app itself:
+
+```js
+const app = createApp().reload({
+  files: ["src", "routes", "rsrc/src"],
+  debounceMs: 80,
+  clear: true,
+});
+```
+
+`createDevServer()` and `http-native dev` keep the current runtime. If you launch with Bun, reload stays on Bun. If you launch with Node, reload stays on Node.
+
+For existing self-starting apps, runtime hot reload still works:
+
+```js
+await app.listen().hot();
 ```
