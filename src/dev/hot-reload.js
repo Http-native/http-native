@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { spawn } from "node:child_process";
 import path from "node:path";
+import { catLog } from "../opt/notify.js";
 
 const DEFAULT_DEBOUNCE_MS = 120;
 const DEFAULT_STARTUP_IGNORE_MS = 250;
@@ -36,7 +37,7 @@ export function createDevWatchController(options = {}) {
     DEFAULT_STARTUP_IGNORE_MS,
   );
   const onChange = typeof options.onChange === "function" ? options.onChange : () => {};
-  const log = options.log ?? (() => {});
+  const log = options.log ?? ((message) => catLog("warn", message));
 
   let watchReadyAt = Date.now() + startupIgnoreMs;
   let restartTimer = null;
@@ -100,7 +101,13 @@ export function createRuntimeHotReloadController(options = {}) {
   );
   const beforeRestart = options.beforeRestart ?? (async () => {});
   const beforeRestartTimeoutMs = normalizeDelayMs(options.beforeRestartTimeoutMs, 2500);
-  const log = options.log ?? ((message) => console.log(message));
+  const emit = (level, message) => {
+    if (typeof options.log === "function") {
+      options.log(message);
+      return;
+    }
+    catLog(level, message);
+  };
 
   let restarting = false;
   const watcher = createDevWatchController({
@@ -113,10 +120,10 @@ export function createRuntimeHotReloadController(options = {}) {
       }
 
       restarting = true;
-      log(`[http-native][hot-reload] change detected: ${changedFile}`);
-      log("[http-native][hot-reload] restarting process...");
+      emit("warn", `hot-reload change detected: ${changedFile}`);
+      emit("info", "hot-reload restarting runtime process");
       watcher.dispose();
-      await runBeforeRestart(beforeRestart, changedFile, beforeRestartTimeoutMs, log);
+      await runBeforeRestart(beforeRestart, changedFile, beforeRestartTimeoutMs, emit);
 
       const argv = process.argv.slice(1);
       let child = null;
@@ -127,13 +134,13 @@ export function createRuntimeHotReloadController(options = {}) {
           stdio: "inherit",
         });
         child.on("error", (error) => {
-          log(`[http-native][hot-reload] failed to respawn: ${error.message}`);
+          emit("error", `hot-reload failed to respawn runtime: ${error.message}`);
         });
         if (typeof child.unref === "function") {
           child.unref();
         }
       } catch (error) {
-        log(`[http-native][hot-reload] failed to respawn: ${error.message}`);
+        emit("error", `hot-reload failed to respawn runtime: ${error.message}`);
       }
 
       process.exit(child ? 0 : 1);
@@ -141,8 +148,9 @@ export function createRuntimeHotReloadController(options = {}) {
     log,
   });
 
-  log(
-    `[http-native][hot-reload] enabled (${watcher.roots.length} roots, debounce=${debounceMs}ms, runtime=${process.release?.name ?? "unknown"})`,
+  emit(
+    "success",
+    `hot-reload enabled roots=${watcher.roots.length} debounce=${debounceMs}ms runtime=${process.release?.name ?? "unknown"}`,
   );
 
   return {
@@ -260,12 +268,12 @@ function normalizeRuntimeWatchRoots(roots) {
     .filter((value) => existsSync(value));
 }
 
-async function runBeforeRestart(beforeRestart, changedFile, timeoutMs, log) {
+async function runBeforeRestart(beforeRestart, changedFile, timeoutMs, emit) {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     try {
       await Promise.resolve(beforeRestart(changedFile));
     } catch (error) {
-      log(`[http-native][hot-reload] pre-restart cleanup failed: ${error.message}`);
+      emit("error", `hot-reload pre-restart cleanup failed: ${error.message}`);
     }
     return;
   }
@@ -281,7 +289,7 @@ async function runBeforeRestart(beforeRestart, changedFile, timeoutMs, log) {
       }),
     ]);
   } catch (error) {
-    log(`[http-native][hot-reload] pre-restart cleanup failed: ${error.message}`);
+    emit("error", `hot-reload pre-restart cleanup failed: ${error.message}`);
   } finally {
     if (timeoutId) {
       clearTimeout(timeoutId);

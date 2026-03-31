@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 
 import { createDevServer } from "./dev/index.js";
+import { runNativeSetupCli } from "../scripts/setup-native.mjs";
 
 function printUsage() {
   console.log("Usage:");
   console.log("  http-native dev <entry> [--host 127.0.0.1] [--port 3000] [--watch path] [--debounce 120] [--no-clear]");
-  console.log("  http-native setup");
+  console.log("  http-native setup [--force] [--tag vX.Y.Z] [--version X.Y.Z]");
 }
 
 function parseDevArgs(argv) {
@@ -66,8 +67,13 @@ function parseDevArgs(argv) {
 const [, , command, ...args] = process.argv;
 
 if (command === "setup") {
-  console.log("http-native: setting up native binary...");
-  console.log("http-native: done.");
+  try {
+    await runNativeSetupCli(args);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[http-native] setup failed: ${message}`);
+    process.exit(1);
+  }
 } else if (command === "dev") {
   const parsed = parseDevArgs(args);
 

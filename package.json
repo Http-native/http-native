@@ -1,17 +1,22 @@
 {
   "name": "@http-native/core",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "type": "module",
   "publishConfig": {
     "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Http-native/http-native.git"
   },
   "bin": {
     "http-native": "./src/cli.js"
   },
   "files": [
     "src",
-    "http-native.node",
-    "http-native.debug.node"
+    "scripts/ensure-native.mjs",
+    "scripts/setup-native.mjs",
+    "scripts/native"
   ],
   "exports": {
     ".": {
@@ -32,6 +37,8 @@
     "build": "bun scripts/build-native.mjs",
     "build:release": "bun scripts/build-native.mjs --release",
     "dev": "bun src/cli.js dev",
+    "postinstall": "bun scripts/ensure-native.mjs || node scripts/ensure-native.mjs",
+    "setup:native": "bun scripts/setup-native.mjs || node scripts/setup-native.mjs",
     "test": "bun run build && bun .github/tests/test.js && bun .github/tests/test-dev.js"
   }
 }

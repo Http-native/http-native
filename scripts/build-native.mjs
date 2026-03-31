@@ -1,9 +1,6 @@
 import { copyFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 
-// unused right?
-// need to double check and delete this
-
 const release = process.argv.includes("--release");
 const profile = release ? "release" : "debug";
 

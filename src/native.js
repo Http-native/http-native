@@ -23,7 +23,7 @@ export function loadNativeModule() {
 
   if (!existsSync(nativeModulePath)) {
     throw new Error(
-      `Native module not found at ${nativeModulePath}. Build it first with "bun run build".`,
+      `Native module not found at ${nativeModulePath}. Run "http-native setup --force" to download it (or "bun run build" in this repo).`,
     );
   }
 

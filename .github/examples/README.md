@@ -3,8 +3,9 @@
 Each folder contains a self-contained example you can run with `bun`:
 
 ```bash
-# Make sure to build the native module first
-bun run build
+# Native binary is downloaded automatically on install.
+# If needed, force refresh:
+http-native setup --force
 
 # Then run any example
 bun .github/examples/basic/server.js

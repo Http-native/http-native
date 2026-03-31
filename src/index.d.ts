@@ -196,9 +196,6 @@ export interface ListenOptions {
 
   /** Override server configuration */
   serverConfig?: HttpServerConfig;
-
-  /** Runtime optimization options */
-  opt?: RuntimeOptimizationOptions;
 }
 
 export interface ReloadOptions {
@@ -255,13 +252,6 @@ export interface ListenHandle extends Promise<ServerHandle> {
   port(value: number): ListenHandle;
 
   /**
-   * Override runtime optimization options before the server starts.
-   *
-   * Supports: await app.listen({ port }).opt({ notify: true })
-   */
-  opt(options?: RuntimeOptimizationOptions): ListenHandle;
-
-  /**
    * Enable TLS/HTTPS with cert and key.
    * Accepts file paths or PEM strings.
    *
@@ -314,6 +304,8 @@ export interface AppConfig {
 
   /** Development and optimization options */
   dev?: {
+    /** Emit optimizer/logger output (default: true) */
+    logger?: boolean;
     /** Restart process on source changes (dev only, default: false) */
     hotReload?: boolean;
     /** Watch roots for hot reload */
@@ -322,7 +314,7 @@ export interface AppConfig {
     hotReloadDebounceMs?: number;
     /** Write dev comments above route declarations (default: true) */
     devComments?: boolean;
-    /** Emit optimization and live-hit logs */
+    /** Alias for logger */
     notify?: boolean;
     /** Collect per-route dispatch timing metrics */
     timing?: boolean;

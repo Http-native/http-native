@@ -68,6 +68,10 @@ function log(level, message) {
   console.log(formatLog(level, message));
 }
 
+export function catLog(level, message) {
+  log(level, message);
+}
+
 export function createOptimizerNotifier(routeEntries, enabled, intervalMs) {
   if (!enabled) {
     return {

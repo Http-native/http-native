@@ -1636,7 +1636,13 @@ export function createApp(config = {}) {
       ...(appConfig.dev.hotReloadPaths !== undefined ? { hotReloadPaths: appConfig.dev.hotReloadPaths } : {}),
       ...(appConfig.dev.hotReloadDebounceMs !== undefined ? { hotReloadDebounceMs: appConfig.dev.hotReloadDebounceMs } : {}),
       ...(appConfig.dev.devComments !== undefined ? { devComments: appConfig.dev.devComments } : {}),
-      ...(appConfig.dev.notify !== undefined ? { notify: appConfig.dev.notify } : {}),
+      ...(
+        appConfig.dev.logger !== undefined
+          ? { notify: appConfig.dev.logger }
+          : appConfig.dev.notify !== undefined
+            ? { notify: appConfig.dev.notify }
+            : {}
+      ),
       ...(appConfig.dev.timing !== undefined ? { timing: appConfig.dev.timing } : {}),
       ...(appConfig.dev.cache !== undefined ? { cache: appConfig.dev.cache } : {}),
     },
@@ -1749,6 +1755,12 @@ export function createApp(config = {}) {
     },
 
     listen(options = {}) {
+      if (options?.opt !== undefined) {
+        throw new Error(
+          "listen().opt() has been removed. Configure runtime options in createApp({ dev: { ... } }) instead.",
+        );
+      }
+
       const startServer = async (listenOptions = options) => {
         // Merge app-level defaults (from createApp config) with per-listen overrides.
         const mergedOptions = {
@@ -1785,9 +1797,10 @@ export function createApp(config = {}) {
       };
 
       let selectedPort = options.port;
-      let selectedOpt = options.opt;
+      let selectedOpt;
       let selectedTls = options.serverConfig?.tls ?? null;
       let startPromise = null;
+      let startBlockedByRemovedOpt = false;
 
       const resolveOptions = () => {
         return {
@@ -1802,6 +1815,12 @@ export function createApp(config = {}) {
       };
 
       const start = () => {
+        if (startBlockedByRemovedOpt) {
+          throw new Error(
+            "listen().opt() has been removed. Configure runtime options in createApp({ dev: { ... } }) instead.",
+          );
+        }
+
         if (!startPromise) {
           const resolvedOptions = resolveOptions();
           const devContext = globalThis.__HTTP_NATIVE_DEV_CONTEXT__;
@@ -1821,20 +1840,11 @@ export function createApp(config = {}) {
           selectedPort = Number(value);
           return chainableListen;
         },
-        opt(optOptions = {}) {
-          if (startPromise) {
-            return startPromise;
-          }
-
-          const safeOptOptions =
-            optOptions && typeof optOptions === "object" ? optOptions : {};
-
-          selectedOpt = {
-            ...(selectedOpt ?? {}),
-            ...safeOptOptions,
-          };
-
-          return chainableListen;
+        opt() {
+          startBlockedByRemovedOpt = true;
+          throw new Error(
+            "listen().opt() has been removed. Configure runtime options in createApp({ dev: { ... } }) instead.",
+          );
         },
         hot(hotOptions = true) {
           if (startPromise) {
@@ -1895,6 +1905,9 @@ export function createApp(config = {}) {
 
       // Preserve previous behavior by starting even when callers don't await.
       queueMicrotask(() => {
+        if (startBlockedByRemovedOpt) {
+          return;
+        }
         void start();
       });
 

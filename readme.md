@@ -12,6 +12,13 @@ A fast, Express-like HTTP framework for JavaScript powered by a Rust native modu
 bun add @http-native/core
 ```
 
+Native binaries are downloaded automatically during install for your OS/arch.
+If you need to repair/re-download manually:
+
+```sh
+http-native setup --force
+```
+
 ## Usage
 
 ```js
@@ -47,7 +54,14 @@ import httpServerConfig from "@http-native/core/http-server.config";
 ## Optimizations
 
 ```js
-const server = await app.listen().port(8190).opt({ devComments: true });
+const app = createApp({
+  dev: {
+    logger: true, // default
+    devComments: true,
+  },
+});
+
+const server = await app.listen().port(8190);
 
 console.log(server.optimizations.summary());
 console.log(server.optimizations.snapshot());
