@@ -65,6 +65,9 @@ pub struct MatchedRoute<'a, 'b> {
     pub needs_query: bool,
     pub fast_path: Option<&'a DynamicFastPathSpec>,
     pub cache_config: Option<&'a RouteCacheConfig>,
+    /// @DX-3.4: per-route body size limit — overrides the global MAX_BODY_BYTES
+    /// when set. None means use the global default.
+    pub max_body_bytes: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -95,6 +98,8 @@ struct DynamicRouteSpec {
     needs_query: bool,
     fast_path: Option<DynamicFastPathSpec>,
     cache_config: Option<RouteCacheConfig>,
+    /// @DX-3.4: per-route body size limit in bytes.
+    max_body_bytes: Option<usize>,
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -347,6 +352,7 @@ impl Router {
                 needs_query: route_spec.needs_query,
                 fast_path: route_spec.fast_path.as_ref(),
                 cache_config: route_spec.cache_config.as_ref(),
+                max_body_bytes: route_spec.max_body_bytes,
             });
         }
 
@@ -374,6 +380,7 @@ impl Router {
             needs_query: spec.needs_query,
             fast_path: spec.fast_path.as_ref(),
             cache_config: spec.cache_config.as_ref(),
+            max_body_bytes: spec.max_body_bytes,
         })
     }
 
@@ -498,6 +505,7 @@ fn compile_dynamic_route_spec(route: &RouteInput, middlewares: &[MiddlewareInput
         needs_query: route.needs_query,
         fast_path: analyze_dynamic_fast_path(route, middlewares),
         cache_config,
+        max_body_bytes: route.max_body_bytes,
     }
 }
 

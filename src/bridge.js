@@ -150,6 +150,27 @@ function analyzeRequestAccessAST(source) {
   }
 
   walkNode(ast, (node) => {
+    /* Handle destructuring: const { headers, query, params } = req */
+    if (node.type === "VariableDeclarator"
+        && node.id?.type === "ObjectPattern"
+        && isReqIdentifier(node.init, reqNames)) {
+      /* Destructuring from req — mark all destructured properties as full access */
+      for (const prop of node.id.properties) {
+        const key = prop.key?.name ?? prop.key?.value;
+        if (!key) { plan.fullParams = true; plan.fullQuery = true; plan.fullHeaders = true; plan.dispatchKind = "generic_fallback"; continue; }
+        switch (key) {
+          case "method": plan.method = true; break;
+          case "path":   plan.path = true;   break;
+          case "url":    plan.url = true;    break;
+          case "params": plan.fullParams = true; plan.dispatchKind = "generic_fallback"; break;
+          case "query":  plan.fullQuery = true;  plan.dispatchKind = "generic_fallback"; break;
+          case "headers": plan.fullHeaders = true; plan.dispatchKind = "generic_fallback"; break;
+          default: break;
+        }
+      }
+      return;
+    }
+
     if (node.type !== "MemberExpression") return;
     if (!isReqIdentifier(node.object, reqNames)) return;
 
@@ -383,6 +404,35 @@ export function mergeRequestAccessPlans(plans) {
 // Pool for request objects — avoids per-request allocations
 const REQUEST_POOL_MAX = 512;
 const requestPool = [];
+
+// @B2.5 — Extended pools for sub-objects (headers, params, query)
+// These pools reuse null-prototype objects instead of creating fresh ones each request.
+const HEADER_POOL_MAX = 256;
+const PARAMS_POOL_MAX = 128;
+const headerPool = [];
+const paramsPool = [];
+
+export function acquireHeaderObject() {
+  return headerPool.pop() || Object.create(null);
+}
+
+export function releaseHeaderObject(obj) {
+  if (headerPool.length >= HEADER_POOL_MAX) return;
+  const keys = Object.keys(obj);
+  for (let i = 0; i < keys.length; i++) delete obj[keys[i]];
+  headerPool.push(obj);
+}
+
+export function acquireParamsObject() {
+  return paramsPool.pop() || Object.create(null);
+}
+
+export function releaseParamsObject(obj) {
+  if (paramsPool.length >= PARAMS_POOL_MAX) return;
+  const keys = Object.keys(obj);
+  for (let i = 0; i < keys.length; i++) delete obj[keys[i]];
+  paramsPool.push(obj);
+}
 
 function acquireRequestObject() {
   return requestPool.pop() || null;
@@ -654,13 +704,67 @@ export function createRequestFactory(
  * @param {string} [mode="fallback"] - Serialization mode hint ("fallback"|"generic"|"specialized")
  * @returns {Function & { kind: string }} Serializer: (value) => Buffer
  */
-export function createJsonSerializer(mode = "fallback") {
+/**
+ * Create a JSON serializer optimized for common response shapes (@B4.3).
+ *
+ * "fallback" mode uses JSON.stringify (safe for any shape).
+ * "shape" mode generates a hand-rolled serializer for objects with known keys,
+ * avoiding the overhead of JSON.stringify's generic traversal.
+ *
+ * @param {"fallback"|"shape"} mode
+ * @param {string[]} [keys] — known object keys (required for "shape" mode)
+ * @returns {(value: unknown) => Buffer}
+ */
+export function createJsonSerializer(mode = "fallback", keys) {
+  if (mode === "shape" && keys && keys.length > 0) {
+    /* Build a hand-rolled serializer for the known shape.
+     * For { id, name, email } produces: '{"id":' + JSON(id) + ',"name":' + JSON(name) + ...
+     * This avoids Object.keys() and generic property traversal. */
+    const prefix = keys.map((k, i) => (i === 0 ? '{"' : ',"') + escapeJsonString(k) + '":');
+    const serializer = (value) => {
+      if (value === null || value === undefined) return Buffer.from("null");
+      let out = "";
+      for (let i = 0; i < keys.length; i++) {
+        out += prefix[i];
+        const v = value[keys[i]];
+        if (typeof v === "string") {
+          out += '"' + escapeJsonString(v) + '"';
+        } else if (v === null || v === undefined) {
+          out += "null";
+        } else {
+          out += JSON.stringify(v);
+        }
+      }
+      out += "}";
+      return Buffer.from(out, "utf8");
+    };
+    serializer.kind = "shape";
+    serializer.keys = keys;
+    return serializer;
+  }
+
   const serializer = (value) => {
     const serialized = JSON.stringify(value);
     return Buffer.from(serialized, "utf8");
   };
   serializer.kind = mode;
   return serializer;
+}
+
+/** Escape a string for safe embedding in JSON (@B4.3 helper). */
+function escapeJsonString(str) {
+  let escaped = "";
+  for (let i = 0; i < str.length; i++) {
+    const ch = str.charCodeAt(i);
+    if (ch === 0x22) escaped += '\\"';       // "
+    else if (ch === 0x5c) escaped += "\\\\"; // \
+    else if (ch === 0x0a) escaped += "\\n";
+    else if (ch === 0x0d) escaped += "\\r";
+    else if (ch === 0x09) escaped += "\\t";
+    else if (ch < 0x20) escaped += "\\u" + ch.toString(16).padStart(4, "0");
+    else escaped += str[i];
+  }
+  return escaped;
 }
 
 // ─── Binary Protocol Codec ──────────────

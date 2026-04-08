@@ -264,6 +264,11 @@ function acquireResponseState() {
     pooled.ncache = null;
     pooled.streaming = false;
     pooled.streamId = null;
+    /* Clear session state to prevent cross-request data leakage */
+    pooled._sessionId = undefined;
+    pooled._sessionIsNew = undefined;
+    pooled._sessionCookie = undefined;
+    pooled._sessionState = undefined;
     return pooled;
   }
 
@@ -497,7 +502,12 @@ const RESPONSE_PROTO = {
     const state = this._state;
     if (state.finished) return this;
     state.status = Number(status);
-    state.headers["location"] = String(url);
+    const urlStr = String(url);
+    /* Block CRLF injection in redirect URLs — same check as res.set() */
+    if (urlStr.includes("\r") || urlStr.includes("\n")) {
+      throw new Error("[http-native] CRLF injection blocked in redirect URL");
+    }
+    state.headers["location"] = urlStr;
     state.body = EMPTY_BUFFER;
     state.finished = true;
     return this;
@@ -666,6 +676,16 @@ function isPromiseLike(value) {
 // ─── Dispatcher ─────────────────────────
 
 function buildDispatchState(snapshot) {
+  /* @B4.6 — compile lifecycle hooks into direct function references.
+   * When no hooks are registered for an event, the function is undefined
+   * and the dispatch path skips the call entirely (zero cost). */
+  const hooks = snapshot.hooks ?? {};
+  const compileHookChain = (fns) => {
+    if (!fns || fns.length === 0) return undefined;
+    if (fns.length === 1) return fns[0];
+    return async (...args) => { for (const fn of fns) await fn(...args); };
+  };
+
   return {
     snapshot,
     ...snapshot,
@@ -673,6 +693,10 @@ function buildDispatchState(snapshot) {
     wsRoutesById: new Map(snapshot.wsRoutes.map((route) => [route.handlerId, route])),
     trackDispatchTiming:
       snapshot.runtimeOptimizer?.shouldCaptureDispatchTiming?.() === true,
+    /* Compiled hook chains — undefined when no hooks registered */
+    onRequest: compileHookChain(hooks.onRequest),
+    onResponse: compileHookChain(hooks.onResponse),
+    onError: compileHookChain(hooks.onError),
   };
 }
 
@@ -740,14 +764,33 @@ function createDispatcher(initialSnapshot) {
 
       const native = loadNativeModule();
       const ws = {
+        id: wsId,
+        /** Send a text or binary message to this connection. */
         send(msg) {
           const chunk = typeof msg === "string" ? Buffer.from(msg, "utf8") : Buffer.from(msg);
           native.streamWrite(Number(wsId), chunk);
         },
+        /** Close the WebSocket connection. */
         close(code = 1000, reason = "") {
           native.streamEnd(Number(wsId));
         },
-        id: wsId,
+        /** Subscribe this connection to a pub/sub topic. */
+        subscribe(topic) {
+          native.wsSubscribe(Number(wsId), topic);
+        },
+        /** Unsubscribe this connection from a pub/sub topic. */
+        unsubscribe(topic) {
+          native.wsUnsubscribe(Number(wsId), topic);
+        },
+        /** Publish a message to all subscribers of a topic (including self). */
+        publish(topic, msg) {
+          const chunk = typeof msg === "string" ? Buffer.from(msg, "utf8") : Buffer.from(msg);
+          return native.wsPublish(topic, chunk);
+        },
+        /** Get the number of subscribers for a topic. */
+        subscriberCount(topic) {
+          return native.wsSubscriberCount(topic);
+        },
       };
 
       try {
@@ -757,8 +800,14 @@ function createDispatcher(initialSnapshot) {
             await route.handlers.open?.(ws);
             break;
           case 0x02: {
+            /* Text message — decode to string */
             const textData = data ? new TextDecoder().decode(data) : "";
             await route.handlers.message?.(ws, textData);
+            break;
+          }
+          case 0x04: {
+            /* Binary message — pass raw Buffer */
+            await route.handlers.message?.(ws, data ?? Buffer.alloc(0));
             break;
           }
           case 0x03:
@@ -1159,6 +1208,12 @@ function probeHandlerForFastPath(route, originalSource) {
 
   // Don't probe if the source contains await (async I/O)
   if (originalSource.includes("await")) {
+    return null;
+  }
+
+  // Don't probe if the handler has side effects beyond req/res calls.
+  // Detect external mutations: array pushes, property assignments on non-res objects, etc.
+  if (/(?<!res)\.\s*(?:push|pop|shift|unshift|splice|set|write|emit|log|warn|error|send)\s*\(/.test(originalSource)) {
     return null;
   }
 
@@ -1579,9 +1634,25 @@ function normalizeManifestCache(cache) {
 
 function buildCompiledApplication(app, normalizedOptions) {
   const compiledMiddlewares = app._middlewares.map(compileMiddlewareRegistration);
-  const errorHandlerPlans = app._errorHandlers.map((handler) =>
-    analyzeRequestAccess(Function.prototype.toString.call(handler)),
-  );
+  /* Error handlers have signature (error, req, res) — the request is the
+   * SECOND parameter, not the first. analyzeRequestAccess assumes the first
+   * parameter is req, which would misidentify `error`. Create a plan that
+   * requests the basic fields error handlers typically need (method, path, url)
+   * without forcing generic_fallback on every route. */
+  const ERROR_HANDLER_PLAN = Object.freeze({
+    method: true,
+    path: true,
+    url: true,
+    fullParams: false,
+    fullQuery: false,
+    fullHeaders: false,
+    paramKeys: new Set(),
+    queryKeys: new Set(),
+    headerKeys: new Set(),
+    dispatchKind: "specialized",
+    jsonFastPath: "fallback",
+  });
+  const errorHandlerPlans = app._errorHandlers.map(() => ERROR_HANDLER_PLAN);
 
   const routes = app._routes.map((route) => {
     let handlerSource =
@@ -1817,6 +1888,56 @@ async function startCompiledServer(compiledSnapshot, normalizedOptions) {
     close() {
       hotReloadController.dispose();
       return closeServerHandle();
+    },
+
+    /**
+     * @DX-6.3: graceful shutdown — stop accepting new connections, drain
+     * in-flight requests up to `timeout` ms, then force-stop workers.
+     *
+     * @param {Object} [options]
+     * @param {number} [options.timeout=30000]    - Maximum drain time in ms
+     * @param {number} [options.forceAfter]       - Hard kill after this many ms (defaults to timeout + 5000)
+     * @param {Function} [options.onDraining]     - Called when draining starts
+     * @param {Function} [options.onDrained]      - Called when all requests finish (before close)
+     * @returns {Promise<{ drained: boolean, remaining: number }>}
+     */
+    async shutdown(options = {}) {
+      const drainTimeout = options.timeout ?? 30000;
+      const forceTimeout = options.forceAfter ?? (drainTimeout + 5000);
+
+      if (typeof options.onDraining === "function") {
+        options.onDraining();
+      }
+
+      /* Use the Rust-side shutdown which sets the draining flag, polls
+       * the in-flight counter, and then force-closes workers. The force
+       * timeout is handled by a JS-side race. */
+      const shutdownPromise = new Promise((resolve) => {
+        try {
+          const remaining = nativeHandle.shutdown(drainTimeout);
+          resolve(remaining);
+        } catch {
+          resolve(0);
+        }
+      });
+
+      const forcePromise = new Promise((resolve) =>
+        setTimeout(() => resolve(-1), forceTimeout),
+      );
+
+      const result = await Promise.race([shutdownPromise, forcePromise]);
+      const remaining = result === -1 ? 0 : result;
+      const drained = remaining === 0;
+
+      if (drained && typeof options.onDrained === "function") {
+        await options.onDrained();
+      }
+
+      hotReloadController.dispose();
+      dispatcher.dispose();
+      ACTIVE_NATIVE_SERVERS.delete(nativeHandle);
+
+      return { drained, remaining };
     },
   };
 
@@ -2114,6 +2235,17 @@ export function createApp(config = {}) {
           selectedTls = tlsConfig;
           return chainableListen;
         },
+        http3(h3Options = { enabled: true }) {
+          if (startPromise) {
+            return startPromise;
+          }
+
+          selectedOpt = {
+            ...(selectedOpt ?? {}),
+            http3: typeof h3Options === "boolean" ? { enabled: h3Options } : h3Options,
+          };
+          return chainableListen;
+        },
         then(onFulfilled, onRejected) {
           return start().then(onFulfilled, onRejected);
         },
@@ -2135,8 +2267,17 @@ export function createApp(config = {}) {
     }
     app._wsRoutes.push({
       path: normalizeRoutePath("GET", path),
-      handlers,
+      handlers: {
+        open: handlers.open,
+        message: handlers.message,
+        close: handlers.close,
+      },
       handlerId: app._allocateHandlerId(),
+      /* DX-4.4 WebSocket config */
+      maxPayloadLength: handlers.maxPayloadLength ?? 64 * 1024,
+      backpressure: handlers.backpressure ?? "drop",
+      idleTimeout: handlers.idleTimeout ?? 120,
+      perMessageDeflate: handlers.perMessageDeflate ?? false,
     });
     return app;
   };
@@ -2191,7 +2332,109 @@ export function createApp(config = {}) {
     });
   };
 
+  // ─── DX-5.4: Decorator Pattern ──────────
+  //
+  // Attach custom properties to every request object. Decorators are set once
+  // at startup and available in every handler as `req.<name>`. This avoids
+  // per-request middleware overhead for injecting services/pools.
+
+  const decorators = Object.create(null);
+
+  /**
+   * Attach a named property to every request object.
+   *
+   * @param {string} name  - Property name accessible on `req`
+   * @param {*} value      - Value or service instance to attach
+   * @returns {Application}
+   */
+  app.decorate = (name, value) => {
+    if (name in decorators) {
+      throw new Error(`Decorator "${name}" is already registered`);
+    }
+    decorators[name] = value;
+    return app;
+  };
+
+  /** @internal — called by bridge to attach decorators to each request */
+  app._applyDecorators = (req) => {
+    for (const key in decorators) {
+      req[key] = decorators[key];
+    }
+  };
+
+  // ─── DX-5.2: Plugin System ────────────
+  //
+  // Plugins are objects with a `setup(app, options)` function called at
+  // registration time and an optional `teardown()` called on shutdown.
+  // Lifecycle hooks are aggregated across plugins and called in order.
+
+  const registeredPlugins = [];
+  const lifecycleHooks = {
+    onRequest: [],
+    onRoute: [],
+    onResponse: [],
+    onError: [],
+    onClose: [],
+  };
+
+  /**
+   * Register lifecycle hooks from plugins.
+   *
+   * @param {"onRequest"|"onRoute"|"onResponse"|"onError"|"onClose"} event
+   * @param {Function} fn
+   * @returns {Application}
+   */
+  app.addHook = (event, fn) => {
+    if (!lifecycleHooks[event]) {
+      throw new Error(`Unknown hook event "${event}"`);
+    }
+    lifecycleHooks[event].push(fn);
+    return app;
+  };
+
+  /**
+   * Install a plugin. Plugins receive the app instance and can register
+   * routes, middleware, hooks, and decorators.
+   *
+   * @param {{ name: string, setup: Function, teardown?: Function }} plugin
+   * @param {Object} [pluginOptions] - Options forwarded to the plugin
+   * @returns {Application}
+   */
+  app.register = (plugin, pluginOptions = {}) => {
+    if (!plugin || typeof plugin.setup !== "function") {
+      throw new Error("Plugin must have a setup(app, options) function");
+    }
+    if (registeredPlugins.some((p) => p.name === plugin.name)) {
+      throw new Error(`Plugin "${plugin.name}" is already registered`);
+    }
+    plugin.setup(app, pluginOptions);
+    registeredPlugins.push(plugin);
+    return app;
+  };
+
+  /** @internal — expose hooks and plugins for bridge/shutdown integration */
+  app._hooks = lifecycleHooks;
+  app._plugins = registeredPlugins;
+
   return app;
+}
+
+/**
+ * Define a plugin object with the standard interface.
+ *
+ * @param {{ name: string, version?: string, setup: Function, teardown?: Function }} definition
+ * @returns {{ name: string, version: string, setup: Function, teardown?: Function }}
+ */
+export function definePlugin(definition) {
+  if (!definition.name) throw new Error("Plugin must have a name");
+  if (typeof definition.setup !== "function")
+    throw new Error("Plugin must have a setup function");
+  return {
+    name: definition.name,
+    version: definition.version ?? "0.0.0",
+    setup: definition.setup,
+    teardown: definition.teardown,
+  };
 }
 
 export {

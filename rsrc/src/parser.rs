@@ -75,8 +75,11 @@ pub fn parse_request_httparse(bytes: &[u8]) -> Option<ParsedRequest<'_>> {
         return None;
     }
 
-    /* extract path (before '?') */
-    let path = target.split(|b| *b == b'?').next()?;
+    /* extract path (before '?') — use SIMD-accelerated memchr for the scan (@B4.1) */
+    let path = match memchr::memchr(b'?', target) {
+        Some(pos) => &target[..pos],
+        None => target,
+    };
 
     let mut keep_alive = version >= 1; // HTTP/1.1+ defaults to keep-alive
     let mut has_body = false;

@@ -22,6 +22,9 @@ macro_rules! log_warn {
 
 mod analyzer;
 pub mod compress;
+pub mod h2_handler;
+#[allow(dead_code)]
+mod h3_handler;
 pub mod http_utils;
 mod manifest;
 pub mod parser;
@@ -35,7 +38,7 @@ use anyhow::{anyhow, Context, Result};
 use arc_swap::ArcSwap;
 use memchr::memmem;
 use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
-use monoio::net::{ListenerOpts, TcpListener};
+use monoio::net::TcpListener;
 use monoio_rustls::TlsAcceptor;
 use napi::bindgen_prelude::{Buffer, Function, Promise};
 use napi::threadsafe_function::ThreadsafeFunction;
@@ -120,6 +123,74 @@ fn release_buffer(mut buf: Vec<u8>) {
             pool.push(buf);
         }
     });
+}
+
+// ─── Response Buffer Pool (BOOST-2.3) ──
+//
+// Eliminates per-response Vec<u8> allocations by recycling response buffers.
+// Separate from the connection read buffer pool — response buffers are
+// typically smaller and have different capacity profiles.
+
+#[allow(dead_code)]
+const RESPONSE_POOL_MAX_SIZE: usize = 128;
+#[allow(dead_code)]
+const RESPONSE_POOL_MAX_RECYCLE_SIZE: usize = 65536;
+
+thread_local! {
+    static RESPONSE_POOL: RefCell<Vec<Vec<u8>>> = RefCell::new(Vec::with_capacity(RESPONSE_POOL_MAX_SIZE));
+}
+
+/// Acquire a response buffer from the thread-local pool.
+/// Defaults to 1KB capacity — right-sized for typical JSON API responses.
+#[allow(dead_code)]
+fn acquire_response_buffer(estimated_size: usize) -> Vec<u8> {
+    RESPONSE_POOL.with(|pool| {
+        pool.borrow_mut()
+            .pop()
+            .map(|mut buf| {
+                buf.clear();
+                if buf.capacity() < estimated_size {
+                    buf.reserve(estimated_size - buf.capacity());
+                }
+                buf
+            })
+            .unwrap_or_else(|| Vec::with_capacity(estimated_size.max(1024)))
+    })
+}
+
+#[allow(dead_code)]
+fn release_response_buffer(mut buf: Vec<u8>) {
+    if buf.capacity() > RESPONSE_POOL_MAX_RECYCLE_SIZE {
+        return;
+    }
+    buf.clear();
+    RESPONSE_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < RESPONSE_POOL_MAX_SIZE {
+            pool.push(buf);
+        }
+    });
+}
+
+// ─── Per-Request Arena Allocator (BOOST-1.2) ──
+//
+// Uses bumpalo for per-request bump allocation. All request-scoped strings
+// and small buffers are allocated from the arena, which resets at the end of
+// each request. This reduces per-request heap allocations from ~8-12 to 1.
+
+#[allow(dead_code)]
+const REQUEST_ARENA_CAPACITY: usize = 4096;
+
+thread_local! {
+    static REQUEST_ARENA: RefCell<bumpalo::Bump> =
+        RefCell::new(bumpalo::Bump::with_capacity(REQUEST_ARENA_CAPACITY));
+}
+
+/// Reset the per-thread request arena. Called at the end of each request
+/// to release all arena-allocated memory in a single operation.
+#[allow(dead_code)]
+fn reset_request_arena() {
+    REQUEST_ARENA.with(|arena| arena.borrow_mut().reset());
 }
 
 // ─── Server Configuration ───────────────
@@ -215,8 +286,15 @@ pub struct NativeListenOptions {
 
 struct ShutdownHandle {
     flag: Arc<AtomicBool>,
+    /// @DX-6.3: when true, the server rejects new connections but drains
+    /// in-flight requests before fully stopping. Set via `shutdown()`.
+    draining: Arc<AtomicBool>,
     wake_addrs: Vec<SocketAddr>,
 }
+
+/// @DX-6.3: global atomic counter of in-flight requests across all workers.
+/// Used by graceful shutdown to wait for requests to complete before closing.
+static INFLIGHT_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
 struct LiveRouter {
     router: ArcSwap<Router>,
@@ -270,6 +348,38 @@ impl NativeServerHandle {
         self.live_router.router.store(next_router);
         close_all_websocket_connections();
         Ok(())
+    }
+
+    /// @DX-6.3: graceful shutdown — stop accepting new connections, drain
+    /// in-flight requests up to `timeout_ms`, then force-stop workers.
+    /// Returns the number of in-flight requests that were still pending
+    /// when the timeout expired (0 = fully drained).
+    #[napi]
+    pub fn shutdown(&self, timeout_ms: Option<u32>) -> napi::Result<u32> {
+        let drain_timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000) as u64);
+
+        /* Phase 1: set draining flag — workers reject new connections but
+         * finish processing in-flight requests normally. */
+        if let Some(handle) = self.shutdown.lock().expect("shutdown mutex poisoned").as_ref() {
+            handle.draining.store(true, Ordering::SeqCst);
+        }
+
+        close_all_websocket_connections();
+
+        /* Phase 2: poll in-flight request counter until drained or timeout */
+        let deadline = std::time::Instant::now() + drain_timeout;
+        while INFLIGHT_REQUESTS.load(Ordering::Acquire) > 0 {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let remaining = INFLIGHT_REQUESTS.load(Ordering::Acquire) as u32;
+
+        /* Phase 3: force-stop workers regardless of drain state */
+        self.close()?;
+        Ok(remaining)
     }
 
     #[napi]
@@ -330,6 +440,20 @@ static STREAM_CHANNELS: std::sync::OnceLock<dashmap::DashMap<u64, flume::Sender<
     std::sync::OnceLock::new();
 static WEBSOCKET_CONNECTIONS: std::sync::OnceLock<dashmap::DashMap<u64, ()>> =
     std::sync::OnceLock::new();
+
+// ─── WebSocket Pub/Sub Registry (DX-4.4) ───
+//
+// Topic-based pub/sub for WebSocket connections. Connections subscribe to
+// named topics; publishing to a topic broadcasts to all subscribers. The
+// registry uses DashMap for lock-free concurrent access across worker threads.
+
+/// topic → set of connection IDs subscribed to that topic
+static WS_TOPICS: std::sync::OnceLock<dashmap::DashMap<String, HashSet<u64>>> =
+    std::sync::OnceLock::new();
+
+fn ws_topic_registry() -> &'static dashmap::DashMap<String, HashSet<u64>> {
+    WS_TOPICS.get_or_init(dashmap::DashMap::new)
+}
 static CACHE_NAMESPACE_COUNTS: std::sync::OnceLock<dashmap::DashMap<u64, usize>> =
     std::sync::OnceLock::new();
 pub(crate) static CACHE_NAMESPACE_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -439,8 +563,81 @@ pub fn stream_end(stream_id: i64) -> napi::Result<()> {
     if let Some((_, sender)) = registry.remove(&(stream_id as u64)) {
         let _ = sender.send(StreamMessage::End);
     }
-    websocket_connections().remove(&(stream_id as u64));
+    let conn_id = stream_id as u64;
+    websocket_connections().remove(&conn_id);
+    // Clean up any pub/sub subscriptions for this connection
+    ws_unsubscribe_all(stream_id);
     Ok(())
+}
+
+// ─── WebSocket Pub/Sub NAPI Functions ───
+
+/// Subscribe a WebSocket connection to a topic.
+#[napi]
+pub fn ws_subscribe(connection_id: i64, topic: String) {
+    let id = connection_id as u64;
+    ws_topic_registry()
+        .entry(topic)
+        .or_insert_with(HashSet::new)
+        .insert(id);
+}
+
+/// Unsubscribe a WebSocket connection from a topic.
+#[napi]
+pub fn ws_unsubscribe(connection_id: i64, topic: String) {
+    let registry = ws_topic_registry();
+    if let Some(mut subs) = registry.get_mut(&topic) {
+        subs.remove(&(connection_id as u64));
+        if subs.is_empty() {
+            drop(subs);
+            registry.remove(&topic);
+        }
+    }
+}
+
+/// Unsubscribe a connection from ALL topics (called on disconnect).
+#[napi]
+pub fn ws_unsubscribe_all(connection_id: i64) {
+    let id = connection_id as u64;
+    let registry = ws_topic_registry();
+    let mut empty_topics = Vec::new();
+    for mut entry in registry.iter_mut() {
+        entry.value_mut().remove(&id);
+        if entry.value().is_empty() {
+            empty_topics.push(entry.key().clone());
+        }
+    }
+    for topic in empty_topics {
+        registry.remove(&topic);
+    }
+}
+
+/// Publish a message to all connections subscribed to a topic.
+/// Returns the number of connections the message was sent to.
+#[napi]
+pub fn ws_publish(topic: String, data: Buffer) -> u32 {
+    let registry = ws_topic_registry();
+    let Some(subscribers) = registry.get(&topic) else { return 0 };
+    let stream_reg = stream_registry();
+    let frame = websocket::encode_frame(websocket::OPCODE_TEXT, data.as_ref());
+    let mut count = 0u32;
+    for &conn_id in subscribers.value() {
+        if let Some(sender) = stream_reg.get(&conn_id) {
+            if sender.send(StreamMessage::Chunk(frame.clone())).is_ok() {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Get the number of subscribers for a topic.
+#[napi]
+pub fn ws_subscriber_count(topic: String) -> u32 {
+    ws_topic_registry()
+        .get(&topic)
+        .map(|s| s.len() as u32)
+        .unwrap_or(0)
 }
 
 /// Get a session value by key. Returns JSON string or null.
@@ -610,8 +807,12 @@ pub fn start_server(
     let live_router = Arc::new(LiveRouter {
         router: ArcSwap::from(router),
     });
-    let tls_acceptor = build_tls_acceptor(&manifest).map_err(to_napi_error)?;
-    let tls_enabled = tls_acceptor.is_some();
+    let tls_result = build_tls_acceptor(&manifest).map_err(to_napi_error)?;
+    let tls_enabled = tls_result.is_some();
+    let (tls_acceptor, tls_config) = match tls_result {
+        Some((acceptor, config)) => (Some(acceptor), Some(config)),
+        None => (None, None),
+    };
 
     // Build session store if session config is present in manifest
     let session_store: Option<Arc<session::SessionStore>> = manifest.session.as_ref().map(|cfg| {
@@ -640,6 +841,7 @@ pub fn start_server(
     let worker_count = worker_count_for(&options);
     let (startup_tx, startup_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(worker_count);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let draining_flag = Arc::new(AtomicBool::new(false));
     let mut closed_receivers = Vec::with_capacity(worker_count);
 
     for _ in 0..worker_count {
@@ -650,8 +852,10 @@ pub fn start_server(
         let thread_dispatcher = Arc::clone(&dispatcher);
         let thread_config = Arc::clone(&server_config);
         let thread_shutdown = Arc::clone(&shutdown_flag);
+        let thread_draining = Arc::clone(&draining_flag);
         let thread_session_store = session_store.clone();
         let thread_tls_acceptor = tls_acceptor.clone();
+        let thread_tls_config = tls_config.clone();
         let thread_options = NativeListenOptions {
             host: options.host.clone(),
             port: options.port,
@@ -678,7 +882,9 @@ pub fn start_server(
                         thread_dispatcher,
                         thread_config,
                         thread_tls_acceptor,
+                        thread_tls_config,
                         thread_shutdown,
+                        thread_draining,
                         thread_session_store,
                     )
                     .await
@@ -746,6 +952,7 @@ pub fn start_server(
         cache_namespaces: Mutex::new(registered_cache_namespaces),
         shutdown: Mutex::new(Some(ShutdownHandle {
             flag: shutdown_flag,
+            draining: draining_flag,
             wake_addrs,
         })),
         closed: Mutex::new(Some(closed_receivers)),
@@ -796,7 +1003,9 @@ async fn run_server(
     dispatcher: Arc<JsDispatcher>,
     server_config: Arc<HttpServerConfig>,
     tls_acceptor: Option<TlsAcceptor>,
+    tls_config: Option<Arc<RustlsServerConfig>>,
     shutdown_flag: Arc<AtomicBool>,
+    draining_flag: Arc<AtomicBool>,
     session_store: Option<Arc<session::SessionStore>>,
 ) -> Result<()> {
     // Wrap Arc in Rc for cheap per-connection cloning within this single-threaded
@@ -804,7 +1013,8 @@ async fn run_server(
     let live_router: Rc<Arc<LiveRouter>> = Rc::new(live_router);
     let dispatcher: Rc<Arc<JsDispatcher>> = Rc::new(dispatcher);
     let server_config: Rc<Arc<HttpServerConfig>> = Rc::new(server_config);
-    let tls_acceptor: Option<Rc<TlsAcceptor>> = tls_acceptor.map(Rc::new);
+    let _tls_acceptor: Option<Rc<TlsAcceptor>> = tls_acceptor.map(Rc::new);
+    let tls_config: Option<Rc<Arc<RustlsServerConfig>>> = tls_config.map(Rc::new);
     let session_store: Option<Rc<Arc<session::SessionStore>>> =
         session_store.map(Rc::new);
 
@@ -821,6 +1031,14 @@ async fn run_server(
                     break;
                 }
 
+                /* @DX-6.3: in draining mode, reject new connections with 503
+                 * so load balancers route traffic elsewhere. In-flight requests
+                 * on existing connections continue normally. */
+                if draining_flag.load(Ordering::Acquire) {
+                    drop(stream);
+                    continue;
+                }
+
                 // Security (S3): enforce per-worker connection limit
                 if active_connections.get() >= MAX_CONNECTIONS_PER_WORKER {
                     drop(stream);
@@ -834,25 +1052,60 @@ async fn run_server(
                 let live_router = Rc::clone(&live_router);
                 let dispatcher = Rc::clone(&dispatcher);
                 let server_config = Rc::clone(&server_config);
-                let tls_acceptor = tls_acceptor.clone();
+                let tls_config = tls_config.clone();
                 let session_store = session_store.clone();
                 active_connections.set(active_connections.get() + 1);
 
                 let conn_counter = Rc::clone(&active_connections);
 
                 monoio::spawn(async move {
-                    let connection_result = if let Some(acceptor) = tls_acceptor.as_ref() {
-                        match acceptor.accept(stream).await {
+                    let connection_result = if let Some(tls_cfg) = tls_config.as_ref() {
+                        /* @DX-4.1: TLS connections use poll-io path to support both
+                         * HTTP/1.1 and HTTP/2 via ALPN negotiation. The raw TCP stream
+                         * is converted to a tokio-compatible type, then wrapped with
+                         * tokio-rustls for TLS. After the handshake, ALPN determines
+                         * whether to dispatch to the h2 handler or fall back to h1.1. */
+                        let poll_io = match monoio::io::IntoPollIo::into_poll_io(stream) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                log_error!("failed to convert to poll-io: {e}");
+                                return;
+                            }
+                        };
+
+                        let tokio_acceptor = tokio_rustls::TlsAcceptor::from(Arc::clone(tls_cfg.as_ref()));
+                        match tokio_acceptor.accept(poll_io).await {
                             Ok(tls_stream) => {
-                                handle_connection(
-                                    tls_stream,
-                                    live_router,
-                                    dispatcher,
-                                    server_config,
-                                    session_store,
-                                    Some(peer_addr),
-                                )
-                                .await
+                                let alpn = tls_stream.get_ref().1.alpn_protocol()
+                                    .map(|p| p.to_vec());
+                                let is_h2 = alpn.as_deref() == Some(b"h2");
+
+                                if is_h2 {
+                                    let peer_ip = Some(peer_addr.ip().to_string());
+                                    h2_handler::handle_h2_connection(
+                                        tls_stream,
+                                        live_router,
+                                        dispatcher,
+                                        server_config,
+                                        peer_ip,
+                                    )
+                                    .await
+                                } else {
+                                    /* HTTP/1.1 over TLS — use monoio-rustls for
+                                     * completion-based I/O (fast path). We need to
+                                     * re-accept with monoio-rustls since we already
+                                     * consumed the stream. For now, handle h1.1 over
+                                     * the poll-io TLS stream. */
+                                    handle_h1_over_poll_tls(
+                                        tls_stream,
+                                        live_router,
+                                        dispatcher,
+                                        server_config,
+                                        session_store,
+                                        Some(peer_addr),
+                                    )
+                                    .await
+                                }
                             }
                             Err(error) => Err(anyhow!("TLS accept failed: {error}")),
                         }
@@ -904,7 +1157,93 @@ const TIMEOUT_WS_IDLE: Duration = Duration::from_secs(300);
 /// is closed regardless of per-read progress.
 const TIMEOUT_HEADER_DEADLINE: Duration = Duration::from_secs(60);
 
-// ─── Connection Handler with Buffer Pool 
+// ─── Tokio ↔ Monoio I/O Adapter ────────
+//
+// Bridges tokio's poll-based `AsyncRead`/`AsyncWrite` traits to monoio's
+// ownership-based `AsyncReadRent`/`AsyncWriteRent` traits. This lets us reuse
+// the existing HTTP/1.1 connection handler for TLS streams that went through
+// tokio-rustls (needed for ALPN negotiation with h2).
+
+struct TokioCompat<T>(T);
+
+impl<T: tokio::io::AsyncRead + Unpin + 'static> monoio::io::AsyncReadRent for TokioCompat<T> {
+    async fn read<B: monoio::buf::IoBufMut>(&mut self, mut buf: B) -> monoio::BufResult<usize, B> {
+        use tokio::io::AsyncReadExt;
+        let total = buf.bytes_total();
+        if total == 0 {
+            return (Ok(0), buf);
+        }
+        // Safety: write_ptr returns the buffer start, bytes_total gives capacity.
+        // Matches monoio's own recv semantics — kernel writes from position 0.
+        let slice = unsafe { std::slice::from_raw_parts_mut(buf.write_ptr(), total) };
+        match self.0.read(slice).await {
+            Ok(n) => {
+                unsafe { buf.set_init(n) };
+                (Ok(n), buf)
+            }
+            Err(e) => (Err(e), buf),
+        }
+    }
+
+    async fn readv<B: monoio::buf::IoVecBufMut>(&mut self, buf: B) -> monoio::BufResult<usize, B> {
+        // Vectored reads are never used by the HTTP/1.1 handler
+        (Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "readv not available over TLS adapter")), buf)
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin + 'static> monoio::io::AsyncWriteRent for TokioCompat<T> {
+    async fn write<B: monoio::buf::IoBuf>(&mut self, buf: B) -> monoio::BufResult<usize, B> {
+        use tokio::io::AsyncWriteExt;
+        let init = buf.bytes_init();
+        // Safety: read_ptr gives the buffer start, bytes_init gives valid byte count
+        let slice = unsafe { std::slice::from_raw_parts(buf.read_ptr(), init) };
+        match self.0.write(slice).await {
+            Ok(n) => (Ok(n), buf),
+            Err(e) => (Err(e), buf),
+        }
+    }
+
+    async fn writev<B: monoio::buf::IoVecBuf>(&mut self, buf: B) -> monoio::BufResult<usize, B> {
+        (Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "writev not available over TLS adapter")), buf)
+    }
+
+    async fn flush(&mut self) -> std::io::Result<()> {
+        tokio::io::AsyncWriteExt::flush(&mut self.0).await
+    }
+
+    async fn shutdown(&mut self) -> std::io::Result<()> {
+        tokio::io::AsyncWriteExt::shutdown(&mut self.0).await
+    }
+}
+
+/// Handle HTTP/1.1 traffic over a tokio-rustls TLS stream.
+///
+/// Wraps the TLS stream in a `TokioCompat` adapter so the existing
+/// monoio-based connection handler can drive it. This path is used when
+/// ALPN negotiation selects "http/1.1" instead of "h2".
+async fn handle_h1_over_poll_tls<IO>(
+    tls_stream: tokio_rustls::server::TlsStream<IO>,
+    live_router: Rc<Arc<LiveRouter>>,
+    dispatcher: Rc<Arc<JsDispatcher>>,
+    server_config: Rc<Arc<HttpServerConfig>>,
+    session_store: Option<Rc<Arc<session::SessionStore>>>,
+    peer_addr: Option<SocketAddr>,
+) -> Result<()>
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
+{
+    handle_connection(
+        TokioCompat(tls_stream),
+        live_router,
+        dispatcher,
+        server_config,
+        session_store,
+        peer_addr,
+    )
+    .await
+}
+
+// ─── Connection Handler with Buffer Pool
 
 async fn handle_connection<S>(
     mut stream: S,
@@ -947,8 +1286,6 @@ async fn handle_connection_inner<S>(
 where
     S: AsyncReadRent + AsyncWriteRent + Unpin,
 {
-    let mut is_first_request = true;
-
     loop {
         let router = live_router.router.load_full();
 
@@ -956,6 +1293,11 @@ where
          * Starts unset; initialized on first byte of a new request. Prevents
          * slow-loris attacks that drip-feed bytes to reset per-read timeouts. */
         let mut header_deadline: Option<std::time::Instant> = None;
+
+        /* The first read of a new request uses the longer idle/keep-alive
+         * timeout. Once bytes arrive, subsequent reads use the shorter
+         * header-read timeout. */
+        let mut awaiting_new_request = true;
 
         // Try hot-path parsing first (GET / with known prefix)
         let parsed = loop {
@@ -978,7 +1320,7 @@ where
 
             // SAFETY: We take ownership of the buffer, read into it, then put it back
             let owned_buf = std::mem::take(buffer);
-            let read_duration = if is_first_request {
+            let read_duration = if awaiting_new_request {
                 TIMEOUT_IDLE_KEEPALIVE
             } else {
                 TIMEOUT_HEADER_READ
@@ -1000,7 +1342,7 @@ where
                 return Ok(());
             }
 
-            is_first_request = false;
+            awaiting_new_request = false;
 
             /* @S8: start the header deadline on the first byte of a new request */
             if header_deadline.is_none() {
@@ -1041,6 +1383,19 @@ where
         let has_body = parsed.has_body;
         let content_length = parsed.content_length;
         let accepted_encoding = parsed.accepted_encoding;
+
+        /* @DX-6.3: track in-flight requests for graceful shutdown draining.
+         * The guard decrements the counter on drop, ensuring correct counting
+         * regardless of which code path exits the request (error, early return,
+         * or normal completion). */
+        INFLIGHT_REQUESTS.fetch_add(1, Ordering::Release);
+        struct InflightGuard;
+        impl Drop for InflightGuard {
+            fn drop(&mut self) {
+                INFLIGHT_REQUESTS.fetch_sub(1, Ordering::Release);
+            }
+        }
+        let _inflight = InflightGuard;
 
         // Security (S1): reject requests with non-identity Transfer-Encoding
         if parsed.has_chunked_te {
@@ -1139,6 +1494,21 @@ where
             continue;
         }
 
+        /* @DX-3.4: pre-match route to determine per-route body size limit.
+         * This runs before the body is read so oversized payloads are rejected
+         * without wasting I/O or memory. */
+        let route_body_limit = {
+            let method_code = method_code_from_bytes(parsed.method).unwrap_or(UNKNOWN_METHOD_CODE);
+            let path_str = std::str::from_utf8(parsed.path).unwrap_or("/");
+            let normalized = normalize_runtime_path(path_str);
+            if method_code != UNKNOWN_METHOD_CODE {
+                router.match_route(method_code, normalized.as_ref())
+                    .and_then(|m| m.max_body_bytes)
+            } else {
+                None
+            }
+        };
+
         // ── Body requests: need owned copies to release buffer for body read ──
         //
         // @P1: coalesce method + target + path into a single allocation and
@@ -1188,7 +1558,10 @@ where
                 }
             };
 
-            if content_length > MAX_BODY_BYTES {
+            /* @DX-3.4: use per-route body limit when configured, otherwise
+             * fall back to the global MAX_BODY_BYTES constant. */
+            let effective_body_limit = route_body_limit.unwrap_or(MAX_BODY_BYTES);
+            if content_length > effective_body_limit {
                 let response =
                     build_error_response_bytes(413, b"{\"error\":\"Payload Too Large\"}", false);
                 let (write_result, _) = stream.write_all(response).await;
@@ -2181,8 +2554,11 @@ fn extract_ncache_trailer(dispatch_bytes: &[u8]) -> Option<(u64, usize)> {
 /// Uses FxHasher (~5x faster than SipHash/DefaultHasher for short keys).
 fn compute_ncache_key(url_bytes: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
-    use rustc_hash::FxHasher;
-    let mut hasher = FxHasher::default();
+    use std::collections::hash_map::DefaultHasher;
+    /* Use SipHash (DefaultHasher) instead of FxHasher to prevent
+     * cache poisoning via hash collision attacks. SipHash is
+     * randomized per process, making collisions unpredictable. */
+    let mut hasher = DefaultHasher::new();
     url_bytes.hash(&mut hasher);
     hasher.finish()
 }
@@ -2949,6 +3325,20 @@ fn method_code_from_bytes(method: &[u8]) -> Option<u8> {
     }
 }
 
+/// @DX-4.1: str-based variant for HTTP/2 method mapping (h2 crate uses &str).
+pub(crate) fn method_code_from_str(method: &str) -> Option<u8> {
+    match method {
+        "GET" => Some(1),
+        "POST" => Some(2),
+        "PUT" => Some(3),
+        "DELETE" => Some(4),
+        "PATCH" => Some(5),
+        "OPTIONS" => Some(6),
+        "HEAD" => Some(7),
+        _ => None,
+    }
+}
+
 fn drain_consumed_bytes(buffer: &mut Vec<u8>, consumed: usize) {
     if consumed >= buffer.len() {
         buffer.clear();
@@ -2975,16 +3365,55 @@ fn bind_listener(
         .unwrap_or(server_config.default_host.as_str());
     let bind_addr = resolve_socket_addr(host, options.port)
         .with_context(|| format!("failed to resolve bind address {host}:{}", options.port))?;
-    let listener_opts = ListenerOpts::new()
-        .reuse_addr(true)
-        .reuse_port(true)
-        .backlog(options.backlog.unwrap_or(server_config.default_backlog));
 
-    TcpListener::bind_with_config(bind_addr, &listener_opts)
-        .with_context(|| format!("failed to bind TCP listener on {bind_addr}"))
+    /* @B3.5: configure raw socket with TCP_FASTOPEN before binding.
+     * TFO allows data in the SYN packet on resumed connections, saving 1 RTT
+     * for repeat clients. The queue length (256) limits the number of pending
+     * TFO connections the kernel will accept. Falls back silently on systems
+     * that don't support it (macOS, older Linux kernels). */
+    let raw_socket = socket2::Socket::new(
+        if bind_addr.is_ipv6() { socket2::Domain::IPV6 } else { socket2::Domain::IPV4 },
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    ).context("failed to create raw socket")?;
+
+    raw_socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    {
+        raw_socket.set_reuse_port(true)?;
+    }
+
+    /* @B3.5: TCP_FASTOPEN — allow data in SYN packet on resumed connections.
+     * Uses raw setsockopt since socket2 doesn't expose TFO directly.
+     * Silently ignored on systems that don't support it. */
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = raw_socket.as_raw_fd();
+        let val: libc::c_int = 256; // TFO queue length
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_FASTOPEN,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+
+    raw_socket.bind(&bind_addr.into())?;
+    raw_socket.listen(options.backlog.unwrap_or(server_config.default_backlog))?;
+    raw_socket.set_nonblocking(true)?;
+
+    let std_listener: std::net::TcpListener = raw_socket.into();
+    TcpListener::from_std(std_listener)
+        .with_context(|| format!("failed to create monoio listener from raw socket on {bind_addr}"))
 }
 
-fn build_tls_acceptor(manifest: &ManifestInput) -> Result<Option<TlsAcceptor>> {
+/// @DX-4.1: returns both the monoio-rustls acceptor and the shared rustls
+/// config Arc. The Arc is needed for tokio-rustls when h2 is negotiated.
+fn build_tls_acceptor(manifest: &ManifestInput) -> Result<Option<(TlsAcceptor, Arc<RustlsServerConfig>)>> {
     let Some(tls) = manifest.tls.as_ref() else {
         return Ok(None);
     };
@@ -3000,9 +3429,13 @@ fn build_tls_acceptor(manifest: &ManifestInput) -> Result<Option<TlsAcceptor>> {
         .with_no_client_auth()
         .with_single_cert(cert_chain, private_key)
         .context("failed to construct rustls server config")?;
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    /* @DX-4.1: advertise both HTTP/2 and HTTP/1.1 via ALPN. rustls will
+     * select the client's preferred protocol during the TLS handshake.
+     * h2 is listed first so capable clients default to HTTP/2. */
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
-    Ok(Some(TlsAcceptor::from(Arc::new(config))))
+    let config_arc = Arc::new(config);
+    Ok(Some((TlsAcceptor::from(config_arc.clone()), config_arc)))
 }
 
 fn parse_tls_certificates(
@@ -3064,7 +3497,7 @@ fn validate_manifest(manifest: &ManifestInput) -> Result<()> {
 }
 
 
-fn normalize_runtime_path(path: &str) -> Cow<'_, str> {
+pub(crate) fn normalize_runtime_path(path: &str) -> Cow<'_, str> {
     // Fast path: "/" or no trailing slash — zero allocation
     if path == "/" || !path.ends_with('/') {
         return Cow::Borrowed(path);

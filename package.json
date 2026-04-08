@@ -56,6 +56,54 @@
       "types": "./src/index.d.ts",
       "default": "./src/request-id.js"
     },
+    "./body-limit": {
+      "types": "./src/index.d.ts",
+      "default": "./src/body-limit.js"
+    },
+    "./csrf": {
+      "types": "./src/index.d.ts",
+      "default": "./src/csrf.js"
+    },
+    "./ip-filter": {
+      "types": "./src/index.d.ts",
+      "default": "./src/ip-filter.js"
+    },
+    "./error": {
+      "types": "./src/index.d.ts",
+      "default": "./src/error.js"
+    },
+    "./audit-log": {
+      "types": "./src/index.d.ts",
+      "default": "./src/audit-log.js"
+    },
+    "./test": {
+      "types": "./src/index.d.ts",
+      "default": "./src/test.js"
+    },
+    "./circuit-breaker": {
+      "types": "./src/index.d.ts",
+      "default": "./src/circuit-breaker.js"
+    },
+    "./env": {
+      "types": "./src/index.d.ts",
+      "default": "./src/env.js"
+    },
+    "./openapi": {
+      "types": "./src/index.d.ts",
+      "default": "./src/openapi.js"
+    },
+    "./multipart": {
+      "types": "./src/index.d.ts",
+      "default": "./src/multipart.js"
+    },
+    "./logger": {
+      "types": "./src/index.d.ts",
+      "default": "./src/logger.js"
+    },
+    "./otel": {
+      "types": "./src/index.d.ts",
+      "default": "./src/otel.js"
+    },
     "./http-server.config": "./src/http-server.config.js"
   },
   "scripts": {
